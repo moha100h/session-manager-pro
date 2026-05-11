@@ -1,57 +1,43 @@
 import os
 import jwt
-import hashlib
-import hmac
-from datetime import datetime, timedelta
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import base64
+from datetime import datetime, timedelta
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import secrets
 
-JWT_SECRET = os.getenv("JWT_SECRET", "change-this")
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "change-this-32ch").encode()[:32]
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me-in-production")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "720"))
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").encode()[:32].ljust(32, b"0")
 
-def create_access_token(data: dict, expires_delta: timedelta = timedelta(hours=24)):
-    to_encode = data.copy()
-    to_encode["exp"] = datetime.utcnow() + expires_delta
-    return jwt.encode(to_encode, JWT_SECRET, algorithm="HS256")
+def create_access_token(data: dict) -> str:
+    payload = {**data, "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRE_HOURS)}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 def verify_token(token: str) -> dict:
+    from fastapi import HTTPException
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.ExpiredSignatureError:
-        raise ValueError("Token expired")
+        raise HTTPException(status_code=401, detail="توکن منقضی شده")
     except jwt.InvalidTokenError:
-        raise ValueError("Invalid token")
+        raise HTTPException(status_code=401, detail="توکن نامعتبر")
 
-def encrypt_session(data: str) -> str:
-    """AES-256-GCM encryption for session data"""
-    key = ENCRYPTION_KEY.ljust(32)[:32]
-    aesgcm = AESGCM(key)
+def encrypt_session(session_string: str) -> str:
+    aesgcm = AESGCM(ENCRYPTION_KEY)
     nonce = secrets.token_bytes(12)
-    ct = aesgcm.encrypt(nonce, data.encode(), None)
+    ct = aesgcm.encrypt(nonce, session_string.encode(), None)
     return base64.b64encode(nonce + ct).decode()
 
 def decrypt_session(encrypted: str) -> str:
-    """Decrypt AES-256-GCM session data"""
-    key = ENCRYPTION_KEY.ljust(32)[:32]
-    aesgcm = AESGCM(key)
+    aesgcm = AESGCM(ENCRYPTION_KEY)
     raw = base64.b64decode(encrypted)
     nonce, ct = raw[:12], raw[12:]
     return aesgcm.decrypt(nonce, ct, None).decode()
 
 def hash_password(password: str) -> str:
-    salt = secrets.token_hex(16)
-    h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000)
-    return f"{salt}:{h.hex()}"
+    import hashlib
+    return hashlib.sha256(password.encode()).hexdigest()
 
 def verify_password(password: str, hashed: str) -> bool:
-    try:
-        salt, h = hashed.split(":")
-        new_h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000)
-        return hmac.compare_digest(h, new_h.hex())
-    except:
-        return False
-
-async def verify_api_key(api_key: str) -> bool:
-    return api_key == os.getenv("API_INTERNAL_KEY", "")
+    return hash_password(password) == hashed
