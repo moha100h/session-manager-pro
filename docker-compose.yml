@@ -1,0 +1,133 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: smp_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - smp_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: smp_redis
+    restart: always
+    command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - smp_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: smp_api
+    restart: always
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - smp_network
+    volumes:
+      - ./sessions:/app/sessions
+      - ./logs:/app/logs
+
+  bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    container_name: smp_bot
+    restart: always
+    env_file: .env
+    depends_on:
+      - api
+    networks:
+      - smp_network
+    volumes:
+      - ./sessions:/app/sessions
+      - ./logs:/app/logs
+
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: smp_worker
+    restart: always
+    env_file: .env
+    depends_on:
+      - api
+    networks:
+      - smp_network
+    volumes:
+      - ./sessions:/app/sessions
+      - ./proxies:/app/proxies
+      - ./logs:/app/logs
+
+  backup-bot:
+    build:
+      context: ./backup-bot
+      dockerfile: Dockerfile
+    container_name: smp_backup
+    restart: always
+    env_file: .env
+    depends_on:
+      - postgres
+    networks:
+      - smp_network
+    volumes:
+      - ./backups:/app/backups
+      - postgres_data:/var/lib/postgresql/data:ro
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: smp_web
+    restart: always
+    networks:
+      - smp_network
+
+  nginx:
+    image: nginx:alpine
+    container_name: smp_nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - api
+      - web
+    networks:
+      - smp_network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  smp_network:
+    driver: bridge
