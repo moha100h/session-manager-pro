@@ -4,8 +4,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 import uuid
 from core.database import fetch_all, fetch_one, execute
-from core.security import verify_token, encrypt_session
-from core.redis_client import cache_delete
+from core.security import verify_token, encrypt_data
 
 router = APIRouter()
 security = HTTPBearer()
@@ -16,123 +15,142 @@ def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(securi
         raise HTTPException(status_code=403, detail="فقط ادمین دسترسی دارد")
     return payload
 
+def parse_uuid(val: str, label: str = "شناسه") -> uuid.UUID:
+    try:
+        return uuid.UUID(val)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail=f"{label} نامعتبر است")
+
 class SessionCreate(BaseModel):
     phone: str
     session_string: str
     api_id: Optional[int] = None
     api_hash: Optional[str] = None
-    country: Optional[str] = None
-    notes: Optional[str] = None
 
-class SessionBulkCreate(BaseModel):
-    sessions: List[SessionCreate]
+class SessionBulkItem(BaseModel):
+    phone: str
+    session_string: str
+    api_id: Optional[int] = None
+    api_hash: Optional[str] = None
 
 @router.get("/stats")
-async def get_session_stats(admin=Depends(get_current_admin)):
+async def session_stats(admin=Depends(get_current_admin)):
     rows = await fetch_all("SELECT status, COUNT(*) as count FROM sessions GROUP BY status")
-    stats = {r["status"]: r["count"] for r in rows}
-    stats["total"] = sum(stats.values())
-    return stats
+    result = {r["status"]: int(r["count"]) for r in rows}
+    result["total"] = sum(result.values())
+    return result
 
 @router.get("/")
 async def list_sessions(
-    page: int = Query(1, ge=1),
-    limit: int = Query(50, ge=1, le=500),
     status: Optional[str] = None,
     search: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=500),
+    page:  int = Query(1, ge=1),
     admin=Depends(get_current_admin)
 ):
     offset = (page - 1) * limit
-    conditions = []
-    params = []
-    idx = 1
+    conditions, params = [], []
 
     if status:
-        conditions.append(f"status=${idx}")
         params.append(status)
-        idx += 1
+        conditions.append(f"status=${len(params)}")
     if search:
-        conditions.append(f"phone ILIKE ${idx}")
         params.append(f"%{search}%")
-        idx += 1
+        conditions.append(f"phone ILIKE ${len(params)}")
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-    params_count = params.copy()
-    total_row = await fetch_one(f"SELECT COUNT(*) as cnt FROM sessions {where}", *params_count)
-    total = total_row["cnt"] if total_row else 0
+
+    params_count = list(params)
+    total = await fetch_one(f"SELECT COUNT(*) as cnt FROM sessions {where}", *params_count)
 
     params.extend([limit, offset])
     rows = await fetch_all(
-        f"SELECT id, phone, status, flood_until, error_count, last_used, last_checked, country, created_at "
-        f"FROM sessions {where} ORDER BY created_at DESC LIMIT ${idx} OFFSET ${idx+1}",
+        f"SELECT id, phone, status, api_id, flood_until, error_count, last_checked, created_at, updated_at "
+        f"FROM sessions {where} ORDER BY created_at DESC LIMIT ${len(params)-1} OFFSET ${len(params)}",
         *params
     )
-    return {"sessions": [dict(r) for r in rows], "total": total, "page": page}
+    return {"sessions": [dict(r) for r in rows], "total": int(total["cnt"]) if total else 0}
 
 @router.post("/")
 async def create_session(data: SessionCreate, admin=Depends(get_current_admin)):
-    existing = await fetch_one("SELECT id FROM sessions WHERE phone=$1", data.phone)
+    if not data.phone.strip():
+        raise HTTPException(status_code=400, detail="شماره تلفن الزامی است")
+    if not data.session_string.strip():
+        raise HTTPException(status_code=400, detail="session_string الزامی است")
+
+    existing = await fetch_one("SELECT id FROM sessions WHERE phone=$1", data.phone.strip())
     if existing:
-        raise HTTPException(status_code=409, detail="این شماره قبلاً ثبت شده")
-    session_id = str(uuid.uuid4())
-    encrypted = encrypt_session(data.session_string)
-    await execute(
-        "INSERT INTO sessions (id, phone, session_string, session_data, api_id, api_hash, country, notes) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-        session_id, data.phone, encrypted, encrypted,
-        data.api_id, data.api_hash, data.country, data.notes
+        raise HTTPException(status_code=409, detail="این شماره قبلاً ثبت شده است")
+
+    encrypted = encrypt_data(data.session_string.strip())
+    row = await fetch_one(
+        """INSERT INTO sessions (phone, session_data, api_id, api_hash)
+           VALUES ($1, $2, $3, $4) RETURNING id, phone, status, created_at""",
+        data.phone.strip(), encrypted, data.api_id, data.api_hash
     )
-    return {"id": session_id, "success": True}
+    return dict(row)
 
 @router.post("/bulk")
-async def bulk_create_sessions(data: SessionBulkCreate, admin=Depends(get_current_admin)):
-    added = 0
-    skipped = 0
-    errors = []
-    for s in data.sessions:
+async def bulk_import(items: List[SessionBulkItem], admin=Depends(get_current_admin)):
+    if not items:
+        raise HTTPException(status_code=400, detail="لیست خالی است")
+    if len(items) > 1000:
+        raise HTTPException(status_code=400, detail="حداکثر ۱۰۰۰ سشن در هر بار")
+
+    added = skipped = failed = 0
+    for item in items:
         try:
-            existing = await fetch_one("SELECT id FROM sessions WHERE phone=$1", s.phone)
+            existing = await fetch_one("SELECT id FROM sessions WHERE phone=$1", item.phone.strip())
             if existing:
                 skipped += 1
                 continue
-            session_id = str(uuid.uuid4())
-            encrypted = encrypt_session(s.session_string)
+            encrypted = encrypt_data(item.session_string.strip())
             await execute(
-                "INSERT INTO sessions (id, phone, session_string, session_data, api_id, api_hash, country, notes) "
-                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-                session_id, s.phone, encrypted, encrypted,
-                s.api_id, s.api_hash, s.country, s.notes
+                "INSERT INTO sessions (phone, session_data, api_id, api_hash) VALUES ($1,$2,$3,$4)",
+                item.phone.strip(), encrypted, item.api_id, item.api_hash
             )
             added += 1
-        except Exception as e:
-            errors.append({"phone": s.phone, "error": str(e)})
-    return {"added": added, "skipped": skipped, "errors": errors}
+        except Exception:
+            failed += 1
+
+    return {"added": added, "skipped": skipped, "failed": failed}
 
 @router.get("/{session_id}")
 async def get_session(session_id: str, admin=Depends(get_current_admin)):
+    uid = parse_uuid(session_id, "شناسه سشن")
     row = await fetch_one(
-        "SELECT id, phone, status, api_id, flood_until, error_count, last_used, last_checked, country, notes, created_at "
-        "FROM sessions WHERE id=$1",
-        uuid.UUID(session_id)
+        "SELECT id, phone, status, api_id, flood_until, error_count, last_checked, created_at, updated_at "
+        "FROM sessions WHERE id=$1", uid
     )
     if not row:
         raise HTTPException(status_code=404, detail="سشن یافت نشد")
     return dict(row)
 
-@router.patch("/{session_id}/status")
-async def update_session_status(session_id: str, status: str, admin=Depends(get_current_admin)):
-    valid_statuses = ["active", "inactive", "logged_out", "deleted", "banned", "flood", "error"]
-    if status not in valid_statuses:
-        raise HTTPException(status_code=400, detail=f"وضعیت نامعتبر. مقادیر مجاز: {valid_statuses}")
-    await execute("UPDATE sessions SET status=$1, updated_at=NOW() WHERE id=$2", status, uuid.UUID(session_id))
-    return {"success": True}
+@router.delete("/logged-out")
+async def delete_logged_out(admin=Depends(get_current_admin)):
+    row = await fetch_one(
+        "WITH deleted AS (DELETE FROM sessions WHERE status IN ('logged_out','deleted') RETURNING id) "
+        "SELECT COUNT(*) as cnt FROM deleted"
+    )
+    return {"deleted": int(row["cnt"]) if row else 0}
 
 @router.delete("/{session_id}")
 async def delete_session(session_id: str, admin=Depends(get_current_admin)):
-    await execute("DELETE FROM sessions WHERE id=$1", uuid.UUID(session_id))
+    uid = parse_uuid(session_id, "شناسه سشن")
+    row = await fetch_one("SELECT id FROM sessions WHERE id=$1", uid)
+    if not row:
+        raise HTTPException(status_code=404, detail="سشن یافت نشد")
+    await execute("DELETE FROM sessions WHERE id=$1", uid)
     return {"success": True}
 
-@router.delete("/bulk/logged-out")
-async def delete_logged_out(admin=Depends(get_current_admin)):
-    result = await execute("DELETE FROM sessions WHERE status IN ('logged_out', 'deleted', 'banned')")
-    return {"success": True, "message": "سشن‌های غیرفعال حذف شدند"}
+@router.patch("/{session_id}/status")
+async def update_status(session_id: str, status: str, admin=Depends(get_current_admin)):
+    uid = parse_uuid(session_id, "شناسه سشن")
+    allowed = {"active", "inactive", "banned", "logged_out"}
+    if status not in allowed:
+        raise HTTPException(status_code=400, detail=f"وضعیت باید یکی از {allowed} باشد")
+    row = await fetch_one("SELECT id FROM sessions WHERE id=$1", uid)
+    if not row:
+        raise HTTPException(status_code=404, detail="سشن یافت نشد")
+    await execute("UPDATE sessions SET status=$1, updated_at=NOW() WHERE id=$2", status, uid)
+    return {"success": True}
