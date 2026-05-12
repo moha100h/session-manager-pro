@@ -1,11 +1,10 @@
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from typing import Optional
 import uuid
 from core.database import fetch_all, fetch_one, execute
 from core.security import verify_token
-from core.redis_client import cache_delete
 
 router = APIRouter()
 security = HTTPBearer()
@@ -16,131 +15,196 @@ def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(securi
         raise HTTPException(status_code=403, detail="فقط ادمین دسترسی دارد")
     return payload
 
-# ─── Settings ───────────────────────────────────────────────
+def parse_uuid(val: str, label: str = "شناسه") -> uuid.UUID:
+    try:
+        return uuid.UUID(val)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail=f"{label} نامعتبر است")
 
 class SettingUpdate(BaseModel):
     value: str
 
-@router.get("/")
-async def get_settings(admin=Depends(get_current_admin)):
-    rows = await fetch_all("SELECT key, value, description FROM settings ORDER BY key")
-    return {r["key"]: {"value": r["value"], "description": r["description"]} for r in rows}
-
-@router.patch("/{key}")
-async def update_setting(key: str, data: SettingUpdate, admin=Depends(get_current_admin)):
-    existing = await fetch_one("SELECT key FROM settings WHERE key=$1", key)
-    if not existing:
-        raise HTTPException(status_code=404, detail="تنظیم یافت نشد")
-    await execute("UPDATE settings SET value=$1, updated_at=NOW() WHERE key=$2", data.value, key)
-    await cache_delete("stats:dashboard")
-    return {"success": True}
-
-# ─── Plans ──────────────────────────────────────────────────
+    @validator("value")
+    def not_empty(cls, v):
+        if v is None or str(v).strip() == "":
+            raise ValueError("مقدار نمی‌تواند خالی باشد")
+        return str(v).strip()
 
 class PlanCreate(BaseModel):
-    name_fa: str
-    name_en: str
+    name_fa:       str
+    name_en:       str
     session_count: int
-    price_usd: float
+    price_usd:     float
     duration_days: Optional[int] = None
+    is_active:     bool = True
+    sort_order:    int = 0
 
+    @validator("session_count")
+    def count_positive(cls, v):
+        if v <= 0:
+            raise ValueError("تعداد سشن باید مثبت باشد")
+        return v
+
+    @validator("price_usd")
+    def price_positive(cls, v):
+        if v <= 0:
+            raise ValueError("قیمت باید مثبت باشد")
+        return v
+
+class PlanUpdate(BaseModel):
+    name_fa:       Optional[str]   = None
+    name_en:       Optional[str]   = None
+    session_count: Optional[int]   = None
+    price_usd:     Optional[float] = None
+    duration_days: Optional[int]   = None
+    is_active:     Optional[bool]  = None
+    sort_order:    Optional[int]   = None
+
+class DiscountCreate(BaseModel):
+    code:      str
+    type:      str = "percent"
+    value:     float
+    min_amount: float = 0
+    max_uses:  Optional[int] = None
+    is_active: bool = True
+
+    @validator("code")
+    def code_upper(cls, v):
+        if not v or not v.strip():
+            raise ValueError("کد تخفیف نمی‌تواند خالی باشد")
+        return v.strip().upper()
+
+    @validator("type")
+    def type_valid(cls, v):
+        if v not in ("percent", "fixed"):
+            raise ValueError("نوع باید percent یا fixed باشد")
+        return v
+
+    @validator("value")
+    def value_positive(cls, v):
+        if v <= 0:
+            raise ValueError("مقدار باید مثبت باشد")
+        return v
+
+# ── Settings ───────────────────────────────────────────────
+@router.get("/")
+async def get_settings(admin=Depends(get_current_admin)):
+    rows = await fetch_all("SELECT key, value, description, updated_at FROM settings ORDER BY key")
+    return {r["key"]: {"value": r["value"], "description": r["description"], "updated_at": str(r["updated_at"])} for r in rows}
+
+@router.put("/{key}")
+async def update_setting(key: str, data: SettingUpdate, admin=Depends(get_current_admin)):
+    row = await fetch_one("SELECT key FROM settings WHERE key=$1", key)
+    if not row:
+        # اگر کلید جدیده (مثل wallet addresses) insert می‌کنیم
+        await execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW()) "
+            "ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()",
+            key, data.value
+        )
+    else:
+        await execute(
+            "UPDATE settings SET value=$1, updated_at=NOW() WHERE key=$2",
+            data.value, key
+        )
+    return {"success": True, "key": key, "value": data.value}
+
+# ── Plans ──────────────────────────────────────────────────
 @router.get("/plans")
-async def get_plans():
-    """عمومی — بدون نیاز به توکن"""
+async def get_plans(admin=Depends(get_current_admin)):
     rows = await fetch_all(
-        "SELECT id, name_fa, name_en, session_count, price_usd, duration_days, is_active, sort_order "
-        "FROM plans WHERE is_active=TRUE ORDER BY sort_order ASC"
+        "SELECT id, name_fa, name_en, session_count, price_usd, duration_days, is_active, sort_order, created_at "
+        "FROM plans ORDER BY sort_order, price_usd"
     )
     return [dict(r) for r in rows]
 
-@router.get("/plans/all")
-async def get_all_plans(admin=Depends(get_current_admin)):
+@router.get("/plans/public")
+async def get_plans_public():
+    """بدون نیاز به auth — برای نمایش به کاربران"""
     rows = await fetch_all(
-        "SELECT id, name_fa, name_en, session_count, price_usd, duration_days, is_active, sort_order "
-        "FROM plans ORDER BY sort_order ASC"
+        "SELECT id, name_fa, name_en, session_count, price_usd, duration_days, sort_order "
+        "FROM plans WHERE is_active=TRUE ORDER BY sort_order, price_usd"
     )
     return [dict(r) for r in rows]
 
 @router.post("/plans")
 async def create_plan(data: PlanCreate, admin=Depends(get_current_admin)):
-    plan_id = str(uuid.uuid4())
-    await execute(
-        "INSERT INTO plans (id, name_fa, name_en, session_count, price_usd, duration_days) "
-        "VALUES ($1,$2,$3,$4,$5,$6)",
-        plan_id, data.name_fa, data.name_en, data.session_count, data.price_usd, data.duration_days
+    row = await fetch_one(
+        """INSERT INTO plans (name_fa, name_en, session_count, price_usd, duration_days, is_active, sort_order)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)
+           RETURNING id, name_fa, name_en, session_count, price_usd, duration_days, is_active, sort_order""",
+        data.name_fa, data.name_en, data.session_count, data.price_usd,
+        data.duration_days, data.is_active, data.sort_order
     )
-    return {"id": plan_id, "success": True}
+    return dict(row)
 
-@router.patch("/plans/{plan_id}/toggle")
-async def toggle_plan(plan_id: str, admin=Depends(get_current_admin)):
-    await execute("UPDATE plans SET is_active=NOT is_active WHERE id=$1", uuid.UUID(plan_id))
+@router.put("/plans/{plan_id}")
+async def update_plan(plan_id: str, data: PlanUpdate, admin=Depends(get_current_admin)):
+    uid = parse_uuid(plan_id, "شناسه پلن")
+    row = await fetch_one("SELECT * FROM plans WHERE id=$1", uid)
+    if not row:
+        raise HTTPException(status_code=404, detail="پلن یافت نشد")
+
+    updates, params = [], [uid]
+    if data.name_fa       is not None: params.append(data.name_fa);       updates.append(f"name_fa=${len(params)}")
+    if data.name_en       is not None: params.append(data.name_en);       updates.append(f"name_en=${len(params)}")
+    if data.session_count is not None: params.append(data.session_count); updates.append(f"session_count=${len(params)}")
+    if data.price_usd     is not None: params.append(data.price_usd);     updates.append(f"price_usd=${len(params)}")
+    if data.duration_days is not None: params.append(data.duration_days); updates.append(f"duration_days=${len(params)}")
+    if data.is_active     is not None: params.append(data.is_active);     updates.append(f"is_active=${len(params)}")
+    if data.sort_order    is not None: params.append(data.sort_order);    updates.append(f"sort_order=${len(params)}")
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="هیچ فیلدی برای آپدیت ارسال نشده")
+
+    await execute(f"UPDATE plans SET {', '.join(updates)} WHERE id=$1", *params)
     return {"success": True}
 
 @router.delete("/plans/{plan_id}")
 async def delete_plan(plan_id: str, admin=Depends(get_current_admin)):
-    await execute("DELETE FROM plans WHERE id=$1", uuid.UUID(plan_id))
+    uid = parse_uuid(plan_id, "شناسه پلن")
+    row = await fetch_one("SELECT id FROM plans WHERE id=$1", uid)
+    if not row:
+        raise HTTPException(status_code=404, detail="پلن یافت نشد")
+    await execute("DELETE FROM plans WHERE id=$1", uid)
     return {"success": True}
 
-# ─── Discounts ──────────────────────────────────────────────
-
-class DiscountCreate(BaseModel):
-    code: str
-    type: str = "percent"   # percent | fixed
-    value: float
-    max_uses: Optional[int] = None
-    min_amount: Optional[float] = 0
-    expires_at: Optional[str] = None
-
-class DiscountValidate(BaseModel):
-    code: str
-    amount: float
-
+# ── Discounts ──────────────────────────────────────────────
 @router.get("/discounts")
 async def get_discounts(admin=Depends(get_current_admin)):
     rows = await fetch_all(
-        "SELECT id, code, type, value, min_amount, max_uses, used_count, is_active, expires_at "
+        "SELECT id, code, type, value, min_amount, max_uses, used_count, is_active, expires_at, created_at "
         "FROM discounts ORDER BY created_at DESC"
     )
     return [dict(r) for r in rows]
 
 @router.post("/discounts")
 async def create_discount(data: DiscountCreate, admin=Depends(get_current_admin)):
-    disc_id = str(uuid.uuid4())
-    expires = None
-    if data.expires_at:
-        from datetime import datetime
-        expires = datetime.fromisoformat(data.expires_at)
-    await execute(
-        "INSERT INTO discounts (id, code, type, value, min_amount, max_uses, expires_at) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7)",
-        disc_id, data.code.upper(), data.type, data.value,
-        data.min_amount or 0, data.max_uses, expires
-    )
-    return {"id": disc_id, "success": True}
-
-@router.post("/discounts/validate")
-async def validate_discount(data: DiscountValidate):
-    """بررسی اعتبار کد تخفیف — عمومی"""
+    existing = await fetch_one("SELECT id FROM discounts WHERE code=$1", data.code)
+    if existing:
+        raise HTTPException(status_code=409, detail="این کد تخفیف قبلاً ثبت شده است")
     row = await fetch_one(
-        "SELECT * FROM discounts WHERE code=$1 AND is_active=TRUE "
-        "AND (expires_at IS NULL OR expires_at > NOW()) "
-        "AND (max_uses IS NULL OR used_count < max_uses)",
-        data.code.upper()
+        """INSERT INTO discounts (code, type, value, min_amount, max_uses, is_active)
+           VALUES ($1,$2,$3,$4,$5,$6)
+           RETURNING id, code, type, value, min_amount, max_uses, is_active, created_at""",
+        data.code, data.type, data.value, data.min_amount, data.max_uses, data.is_active
     )
-    if not row:
-        raise HTTPException(status_code=404, detail="کد تخفیف نامعتبر یا منقضی شده")
-    if data.amount < row["min_amount"]:
-        raise HTTPException(status_code=400, detail=f"حداقل مبلغ برای این کد: ${row['min_amount']}")
-    discount_amount = (data.amount * row["value"] / 100) if row["type"] == "percent" else row["value"]
-    final = max(0, data.amount - discount_amount)
-    return {"valid": True, "discount_amount": round(discount_amount, 2), "final_amount": round(final, 2)}
+    return dict(row)
 
 @router.delete("/discounts/{discount_id}")
 async def delete_discount(discount_id: str, admin=Depends(get_current_admin)):
-    await execute("DELETE FROM discounts WHERE id=$1", uuid.UUID(discount_id))
+    uid = parse_uuid(discount_id, "شناسه تخفیف")
+    row = await fetch_one("SELECT id FROM discounts WHERE id=$1", uid)
+    if not row:
+        raise HTTPException(status_code=404, detail="کد تخفیف یافت نشد")
+    await execute("DELETE FROM discounts WHERE id=$1", uid)
     return {"success": True}
 
 @router.patch("/discounts/{discount_id}/toggle")
 async def toggle_discount(discount_id: str, admin=Depends(get_current_admin)):
-    await execute("UPDATE discounts SET is_active=NOT is_active WHERE id=$1", uuid.UUID(discount_id))
-    return {"success": True}
+    uid = parse_uuid(discount_id, "شناسه تخفیف")
+    row = await fetch_one("SELECT id, is_active FROM discounts WHERE id=$1", uid)
+    if not row:
+        raise HTTPException(status_code=404, detail="کد تخفیف یافت نشد")
+    await execute("UPDATE discounts SET is_active=$1 WHERE id=$2", not row["is_active"], uid)
+    return {"success": True, "is_active": not row["is_active"]}
