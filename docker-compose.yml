@@ -91,8 +91,8 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      API_URL:     "http://api:8000"
-      LOG_DIR:     "/app/logs"
+      API_URL: "http://api:8000"
+      LOG_DIR: "/app/logs"
     volumes:
       - logs_data:/app/logs
     depends_on:
@@ -141,8 +141,7 @@ services:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - nginx_logs:/var/log/nginx
     depends_on:
-      api:
-        condition: service_healthy
+      - api
       - web
     networks:
       - smp_net
