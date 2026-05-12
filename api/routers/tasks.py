@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional
@@ -10,82 +10,120 @@ from core.redis_client import enqueue_task
 router = APIRouter()
 security = HTTPBearer()
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    return verify_token(credentials.credentials)
-
 def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
     payload = verify_token(credentials.credentials)
-    if not payload.get("is_admin"):
-        raise HTTPException(status_code=403, detail="Admin access required")
+    if payload.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="فقط ادمین دسترسی دارد")
     return payload
 
-class TaskCreate(BaseModel):
-    type: str
+class JoinTaskCreate(BaseModel):
     target: str
-    target_type: str = "link"
+    target_type: str = "link"   # link | username | id
     session_count: int
-    auto_leave_after: Optional[int] = None
     join_delay_min: int = 3
     join_delay_max: int = 8
+    auto_leave_after: Optional[int] = None   # دقیقه
     priority: int = 5
+    user_id: Optional[int] = None
 
-@router.post("")
-async def create_task(data: TaskCreate, user=Depends(get_current_user)):
-    if data.session_count < 1 or data.session_count > 40000:
-        raise HTTPException(status_code=400, detail="Invalid session count (1-40000)")
-    available = await fetch_one("SELECT COUNT(*) FROM sessions WHERE status = 'active'")
-    if available[0] < data.session_count:
-        raise HTTPException(status_code=400, detail=f"Not enough active sessions. Available: {available[0]}")
-    row = await fetch_one(
-        """INSERT INTO tasks (user_id, type, target, target_type, session_count, auto_leave_after, join_delay_min, join_delay_max, priority)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id""",
-        user.get("user_id"), data.type, data.target, data.target_type,
-        data.session_count, data.auto_leave_after, data.join_delay_min, data.join_delay_max, data.priority
+@router.post("/join")
+async def create_join_task(data: JoinTaskCreate, admin=Depends(get_current_admin)):
+    if data.session_count < 1:
+        raise HTTPException(status_code=400, detail="تعداد سشن باید حداقل ۱ باشد")
+    if data.join_delay_min > data.join_delay_max:
+        raise HTTPException(status_code=400, detail="تأخیر حداقل نباید از حداکثر بیشتر باشد")
+
+    # بررسی تعداد سشن‌های فعال
+    active_count = await fetch_one("SELECT COUNT(*) as cnt FROM sessions WHERE status='active'")
+    if active_count["cnt"] < 1:
+        raise HTTPException(status_code=400, detail="هیچ سشن فعالی وجود ندارد")
+
+    task_id = str(uuid.uuid4())
+    await execute(
+        "INSERT INTO tasks (id, user_id, type, target, target_type, session_count, "
+        "join_delay_min, join_delay_max, auto_leave_after, priority, status) "
+        "VALUES ($1,$2,'join',$3,$4,$5,$6,$7,$8,$9,'pending')",
+        task_id, data.user_id, data.target, data.target_type, data.session_count,
+        data.join_delay_min, data.join_delay_max, data.auto_leave_after, data.priority
     )
-    task_id = str(row["id"])
-    sessions = await fetch_all("SELECT id FROM sessions WHERE status = 'active' ORDER BY RANDOM() LIMIT $1", data.session_count)
-    if sessions:
-        await execute(
-            "INSERT INTO task_sessions (task_id, session_id) SELECT $1, unnest($2::uuid[])",
-            uuid.UUID(task_id), [r["id"] for r in sessions]
-        )
-    await enqueue_task("tasks:queue", {"task_id": task_id, "type": data.type, "priority": data.priority})
-    return {"task_id": task_id, "status": "pending", "sessions_assigned": len(sessions)}
+    # ارسال به صف Redis
+    await enqueue_task("tasks:join", {
+        "task_id": task_id,
+        "target": data.target,
+        "target_type": data.target_type,
+        "session_count": data.session_count,
+        "join_delay_min": data.join_delay_min,
+        "join_delay_max": data.join_delay_max,
+        "auto_leave_after": data.auto_leave_after,
+        "priority": data.priority
+    })
+    return {"task_id": task_id, "status": "pending"}
 
-@router.get("")
-async def list_tasks(status: Optional[str] = None, page: int = 1, limit: int = 20, user=Depends(get_current_user)):
+@router.get("/")
+async def list_tasks(
+    status: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    page: int = Query(1, ge=1),
+    admin=Depends(get_current_admin)
+):
     offset = (page - 1) * limit
-    is_admin = user.get("is_admin", False)
-    params = [] if is_admin else [user.get("user_id")]
-    where = "WHERE 1=1" if is_admin else "WHERE user_id = $1"
-    i = len(params) + 1
-    if status:
-        where += f" AND status = ${i}"; params.append(status); i+=1
-    rows = await fetch_all(f"SELECT * FROM tasks {where} ORDER BY created_at DESC LIMIT ${i} OFFSET ${i+1}", *params, limit, offset)
+    where = "WHERE status=$1" if status else ""
+    params = [status, limit, offset] if status else [limit, offset]
+    idx_limit = 2 if status else 1
+    rows = await fetch_all(
+        f"SELECT id, type, target, target_type, session_count, sessions_done, sessions_failed, "
+        f"status, join_delay_min, join_delay_max, auto_leave_after, created_at, started_at, completed_at "
+        f"FROM tasks {where} ORDER BY created_at DESC LIMIT ${idx_limit} OFFSET ${idx_limit+1}",
+        *params
+    )
     return [dict(r) for r in rows]
 
 @router.get("/{task_id}")
-async def get_task(task_id: str, user=Depends(get_current_user)):
-    row = await fetch_one("SELECT * FROM tasks WHERE id = $1", uuid.UUID(task_id))
-    if not row: raise HTTPException(status_code=404, detail="Task not found")
-    sessions = await fetch_all(
-        "SELECT ts.status, s.phone, ts.joined_at, ts.left_at, ts.error FROM task_sessions ts JOIN sessions s ON s.id = ts.session_id WHERE ts.task_id = $1 LIMIT 200",
+async def get_task(task_id: str, admin=Depends(get_current_admin)):
+    row = await fetch_one("SELECT * FROM tasks WHERE id=$1", uuid.UUID(task_id))
+    if not row:
+        raise HTTPException(status_code=404, detail="تسک یافت نشد")
+    return dict(row)
+
+@router.get("/{task_id}/sessions")
+async def get_task_sessions(task_id: str, admin=Depends(get_current_admin)):
+    rows = await fetch_all(
+        "SELECT ts.session_id, s.phone, ts.status, ts.error, ts.joined_at, ts.left_at "
+        "FROM task_sessions ts JOIN sessions s ON ts.session_id=s.id "
+        "WHERE ts.task_id=$1 ORDER BY ts.joined_at DESC LIMIT 100",
         uuid.UUID(task_id)
     )
-    return {**dict(row), "session_details": [dict(s) for s in sessions]}
+    return [dict(r) for r in rows]
 
 @router.post("/{task_id}/cancel")
 async def cancel_task(task_id: str, admin=Depends(get_current_admin)):
-    await execute("UPDATE tasks SET status = 'cancelled' WHERE id = $1", uuid.UUID(task_id))
+    row = await fetch_one("SELECT status FROM tasks WHERE id=$1", uuid.UUID(task_id))
+    if not row:
+        raise HTTPException(status_code=404, detail="تسک یافت نشد")
+    if row["status"] in ("completed", "cancelled"):
+        raise HTTPException(status_code=400, detail="این تسک قابل لغو نیست")
+    await execute("UPDATE tasks SET status='cancelled' WHERE id=$1", uuid.UUID(task_id))
     return {"success": True}
 
 @router.post("/{task_id}/pause")
 async def pause_task(task_id: str, admin=Depends(get_current_admin)):
-    await execute("UPDATE tasks SET status = 'paused' WHERE id = $1", uuid.UUID(task_id))
+    row = await fetch_one("SELECT status FROM tasks WHERE id=$1", uuid.UUID(task_id))
+    if not row:
+        raise HTTPException(status_code=404, detail="تسک یافت نشد")
+    if row["status"] != "running":
+        raise HTTPException(status_code=400, detail="فقط تسک‌های در حال اجرا را می‌توان متوقف کرد")
+    await execute("UPDATE tasks SET status='paused' WHERE id=$1", uuid.UUID(task_id))
     return {"success": True}
 
 @router.post("/{task_id}/resume")
 async def resume_task(task_id: str, admin=Depends(get_current_admin)):
-    await execute("UPDATE tasks SET status = 'running' WHERE id = $1", uuid.UUID(task_id))
-    await enqueue_task("tasks:queue", {"task_id": task_id, "type": "resume"})
+    row = await fetch_one("SELECT status FROM tasks WHERE id=$1", uuid.UUID(task_id))
+    if not row:
+        raise HTTPException(status_code=404, detail="تسک یافت نشد")
+    if row["status"] != "paused":
+        raise HTTPException(status_code=400, detail="فقط تسک‌های متوقف را می‌توان از سر گرفت")
+    await execute("UPDATE tasks SET status='pending' WHERE id=$1", uuid.UUID(task_id))
+    task_data = dict(row)
+    task_data["task_id"] = task_id
+    await enqueue_task("tasks:join", task_data)
     return {"success": True}
