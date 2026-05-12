@@ -4,20 +4,20 @@ import logging
 import subprocess
 import gzip
 import shutil
+import re
 from datetime import datetime
-import aiofiles
-import aiogram
+
+import asyncpg
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message, FSInputFile
-import asyncpg
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("backup-bot")
 
-BACKUP_BOT_TOKEN = os.getenv("BACKUP_BOT_TOKEN")
+BACKUP_BOT_TOKEN = os.getenv("BACKUP_BOT_TOKEN", "")
 BACKUP_CHAT_ID = int(os.getenv("BACKUP_CHAT_ID", "0"))
-DB_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 BACKUP_DIR = "/app/backups"
 BACKUP_INTERVAL_HOURS = int(os.getenv("BACKUP_INTERVAL_HOURS", "1"))
 
@@ -26,73 +26,79 @@ os.makedirs(BACKUP_DIR, exist_ok=True)
 bot = Bot(token=BACKUP_BOT_TOKEN)
 dp = Dispatcher()
 
-async def create_backup() -> str:
-    """ساخت بکاپ از PostgreSQL"""
+def parse_db_url(url: str):
+    match = re.match(r"postgresql://([^:]+):([^@]+)@([^:/]+):(\d+)/(.+)", url)
+    if not match:
+        raise ValueError(f"Invalid DATABASE_URL: {url}")
+    return match.groups()  # user, password, host, port, dbname
+
+async def create_backup():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dump_file = f"{BACKUP_DIR}/backup_{timestamp}.sql"
     gz_file = f"{dump_file}.gz"
 
-    # Parse DB URL
-    import re
-    match = re.match(r"postgresql://([^:]+):([^@]+)@([^:]+):(\d+)/(.+)", DB_URL)
-    if not match:
-        raise ValueError("Invalid DATABASE_URL format")
-    user, password, host, port, dbname = match.groups()
-
+    user, password, host, port, dbname = parse_db_url(DATABASE_URL)
     env = os.environ.copy()
     env["PGPASSWORD"] = password
 
     result = subprocess.run(
         ["pg_dump", "-h", host, "-p", port, "-U", user, "-d", dbname,
-         "--no-password", "--format=plain", "--encoding=UTF8", "-f", dump_file],
+         "--no-password", "--format=plain", "--encoding=UTF8"],
         env=env, capture_output=True, text=True
     )
-
     if result.returncode != 0:
-        raise RuntimeError(f"pg_dump failed: {result.stderr}")
+        raise RuntimeError(f"pg_dump failed: {result.stderr[:500]}")
 
-    # Compress
-    with open(dump_file, "rb") as f_in:
-        with gzip.open(gz_file, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
+    with gzip.open(gz_file, "wt", encoding="utf-8") as f_out:
+        f_out.write(result.stdout)
 
-    os.remove(dump_file)
     size_mb = os.path.getsize(gz_file) / 1024 / 1024
     logger.info(f"Backup created: {gz_file} ({size_mb:.2f} MB)")
     return gz_file, size_mb
 
+async def get_db_stats():
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        sessions = await conn.fetchval("SELECT COUNT(*) FROM sessions")
+        active = await conn.fetchval("SELECT COUNT(*) FROM sessions WHERE status='active'")
+        users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        tasks = await conn.fetchval("SELECT COUNT(*) FROM tasks")
+        orders = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status='confirmed'")
+        await conn.close()
+        return {"sessions": sessions, "active": active, "users": users, "tasks": tasks, "orders": orders}
+    except Exception as e:
+        logger.error(f"DB stats error: {e}")
+        return {}
+
 async def send_backup():
-    """ارسال بکاپ به تلگرام"""
     try:
         gz_file, size_mb = await create_backup()
+        stats = await get_db_stats()
         timestamp = datetime.now().strftime("%Y/%m/%d %H:%M")
-
-        # Get DB stats
-        conn = await asyncpg.connect(DB_URL)
-        sessions_count = await conn.fetchval("SELECT COUNT(*) FROM sessions")
-        users_count = await conn.fetchval("SELECT COUNT(*) FROM users")
-        tasks_count = await conn.fetchval("SELECT COUNT(*) FROM tasks")
-        await conn.close()
 
         caption = (
             f"📦 *بکاپ خودکار سیستم*
 
 "
-            f"📅 تاریخ: {timestamp}
+            f"📅 تاریخ: `{timestamp}`
 "
-            f"💾 حجم: {size_mb:.2f} MB
+            f"💾 حجم: `{size_mb:.2f} MB`
 
 "
             f"📊 *آمار دیتابیس:*
 "
-            f"📱 سشن‌ها: {sessions_count:,}
+            f"📱 کل سشن‌ها: `{stats.get('sessions', 0):,}`
 "
-            f"👥 کاربران: {users_count:,}
+            f"🟢 سشن فعال: `{stats.get('active', 0):,}`
 "
-            f"📋 تسک‌ها: {tasks_count:,}
+            f"👥 کاربران: `{stats.get('users', 0):,}`
+"
+            f"📋 تسک‌ها: `{stats.get('tasks', 0):,}`
+"
+            f"💰 سفارشات تأیید‌شده: `{stats.get('orders', 0):,}`
 
 "
-            f"✅ برای ریکاوری: /restore"
+            f"✅ سیستم سالم است"
         )
 
         document = FSInputFile(gz_file, filename=os.path.basename(gz_file))
@@ -102,31 +108,45 @@ async def send_backup():
             caption=caption,
             parse_mode="Markdown"
         )
-        logger.info(f"Backup sent to Telegram: {size_mb:.2f} MB")
+        logger.info(f"Backup sent: {size_mb:.2f} MB")
 
-        # Cleanup old backups (keep last 24)
+        # نگه داشتن آخرین ۲۴ بکاپ
         backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith(".gz")])
         for old in backups[:-24]:
-            os.remove(os.path.join(BACKUP_DIR, old))
+            try:
+                os.remove(os.path.join(BACKUP_DIR, old))
+            except Exception:
+                pass
 
     except Exception as e:
         logger.error(f"Backup error: {e}")
-        await bot.send_message(BACKUP_CHAT_ID, f"❌ خطا در بکاپ‌گیری:
-`{str(e)}`", parse_mode="Markdown")
+        try:
+            await bot.send_message(
+                BACKUP_CHAT_ID,
+                f"❌ *خطا در بکاپ‌گیری*
+
+`{str(e)[:500]}`",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+def is_authorized(message: Message) -> bool:
+    return message.chat.id == BACKUP_CHAT_ID
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    if message.chat.id != BACKUP_CHAT_ID:
+    if not is_authorized(message):
         return
     await message.answer(
         "🤖 *بات بکاپ سیستم*
 
 "
-        "دستورات:
+        "دستورات موجود:
 "
         "/backup — بکاپ فوری
 "
-        "/status — وضعیت سیستم
+        "/status — وضعیت دیتابیس
 "
         "/list — لیست بکاپ‌ها
 "
@@ -136,68 +156,62 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("backup"))
 async def cmd_backup(message: Message):
-    if message.chat.id != BACKUP_CHAT_ID:
+    if not is_authorized(message):
         return
-    await message.answer("⏳ در حال ساخت بکاپ...")
+    msg = await message.answer("⏳ در حال ساخت بکاپ...")
     await send_backup()
+    await msg.delete()
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
-    if message.chat.id != BACKUP_CHAT_ID:
+    if not is_authorized(message):
         return
-    try:
-        conn = await asyncpg.connect(DB_URL)
-        sessions = await conn.fetch("SELECT status, COUNT(*) as count FROM sessions GROUP BY status")
-        tasks = await conn.fetch("SELECT status, COUNT(*) as count FROM tasks GROUP BY status")
-        await conn.close()
-
-        sessions_text = "
-".join([f"  {r['status']}: {r['count']:,}" for r in sessions])
-        tasks_text = "
-".join([f"  {r['status']}: {r['count']:,}" for r in tasks])
-
-        await message.answer(
-            f"📊 *وضعیت سیستم*
+    stats = await get_db_stats()
+    if not stats:
+        return await message.answer("❌ خطا در اتصال به دیتابیس")
+    await message.answer(
+        f"📊 *وضعیت سیستم*
 
 "
-            f"📱 *سشن‌ها:*
-{sessions_text}
-
+        f"📱 کل سشن‌ها: `{stats.get('sessions', 0):,}`
 "
-            f"📋 *تسک‌ها:*
-{tasks_text}",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        await message.answer(f"❌ خطا: {e}")
+        f"🟢 سشن فعال: `{stats.get('active', 0):,}`
+"
+        f"👥 کاربران: `{stats.get('users', 0):,}`
+"
+        f"📋 تسک‌ها: `{stats.get('tasks', 0):,}`
+"
+        f"💰 سفارشات تأیید‌شده: `{stats.get('orders', 0):,}`",
+        parse_mode="Markdown"
+    )
 
 @dp.message(Command("list"))
 async def cmd_list(message: Message):
-    if message.chat.id != BACKUP_CHAT_ID:
+    if not is_authorized(message):
         return
     backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith(".gz")], reverse=True)
     if not backups:
         return await message.answer("📭 هیچ بکاپی موجود نیست.")
-    text = "📦 *بکاپ‌های موجود:*
-
-"
+    lines = []
     for b in backups[:10]:
         size = os.path.getsize(os.path.join(BACKUP_DIR, b)) / 1024 / 1024
-        text += f"• `{b}` — {size:.1f} MB
-"
-    await message.answer(text, parse_mode="Markdown")
+        lines.append(f"• `{b}` — {size:.1f} MB")
+    await message.answer("📦 *بکاپ‌های موجود:*
+
+" + "
+".join(lines), parse_mode="Markdown")
 
 @dp.message(Command("restore"))
 async def cmd_restore(message: Message):
-    if message.chat.id != BACKUP_CHAT_ID:
+    if not is_authorized(message):
         return
     await message.answer(
         "🔄 *راهنمای ریکاوری*
 
 "
-        "1. فایل بکاپ را دانلود کنید
+        "۱. فایل بکاپ را دانلود کنید
 "
-        "2. روی سرور اجرا کنید:
+        "۲. روی سرور اجرا کنید:
 
 "
         "```bash
@@ -209,11 +223,11 @@ async def cmd_restore(message: Message):
 "
         "# Restore
 "
-        "docker exec -i smp_postgres psql \
+        "docker exec -i smp_postgres psql \\
 "
-        "  -U $POSTGRES_USER \
+        "  -U $POSTGRES_USER \\
 "
-        "  -d $POSTGRES_DB \
+        "  -d $POSTGRES_DB \\
 "
         "  < backup_YYYYMMDD_HHMMSS.sql
 "
@@ -222,16 +236,23 @@ async def cmd_restore(message: Message):
     )
 
 async def backup_scheduler():
-    """زمان‌بند بکاپ خودکار"""
+    logger.info(f"Backup scheduler started — interval: {BACKUP_INTERVAL_HOURS}h")
+    # اولین بکاپ بعد از ۵ دقیقه
+    await asyncio.sleep(300)
     while True:
-        await asyncio.sleep(BACKUP_INTERVAL_HOURS * 3600)
-        logger.info("Running scheduled backup...")
         await send_backup()
+        await asyncio.sleep(BACKUP_INTERVAL_HOURS * 3600)
 
 async def main():
-    logger.info(f"🤖 Backup bot started (interval: {BACKUP_INTERVAL_HOURS}h)")
+    if not BACKUP_BOT_TOKEN:
+        logger.error("BACKUP_BOT_TOKEN not set!")
+        return
+    if not BACKUP_CHAT_ID:
+        logger.error("BACKUP_CHAT_ID not set!")
+        return
+    logger.info("🤖 Backup bot starting...")
     asyncio.create_task(backup_scheduler())
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
