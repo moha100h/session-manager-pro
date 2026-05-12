@@ -6,14 +6,14 @@ services:
     container_name: smp_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-session_manager}
-      POSTGRES_USER: ${POSTGRES_USER:-smp_user}
+      POSTGRES_DB:       ${POSTGRES_DB:-session_manager}
+      POSTGRES_USER:     ${POSTGRES_USER:-smuser}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-smp_user} -d ${POSTGRES_DB:-session_manager}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-smuser} -d ${POSTGRES_DB:-session_manager}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -25,7 +25,7 @@ services:
     image: redis:7-alpine
     container_name: smp_redis
     restart: unless-stopped
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save 60 1
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --save 60 1 --appendonly yes
     volumes:
       - redis_data:/data
     healthcheck:
@@ -45,8 +45,8 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_URL: "postgresql://${POSTGRES_USER:-smp_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-session_manager}"
-      REDIS_URL: "redis://redis:6379"
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-smuser}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-session_manager}"
+      REDIS_URL:    "redis://redis:6379"
     volumes:
       - logs_data:/app/logs
     depends_on:
@@ -57,11 +57,11 @@ services:
     networks:
       - smp_net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
-      interval: 30s
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/health || exit 1"]
+      interval: 15s
       timeout: 10s
-      retries: 3
-      start_period: 20s
+      retries: 5
+      start_period: 30s
 
   worker:
     build:
@@ -71,16 +71,14 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_URL: "postgresql://${POSTGRES_USER:-smp_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-session_manager}"
-      REDIS_URL: "redis://redis:6379"
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-smuser}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-session_manager}"
+      REDIS_URL:    "redis://redis:6379"
     volumes:
       - logs_data:/app/logs
     depends_on:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_healthy
-      api:
         condition: service_healthy
     networks:
       - smp_net
@@ -93,7 +91,8 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      API_URL: "http://api:8000"
+      API_URL:     "http://api:8000"
+      LOG_DIR:     "/app/logs"
     volumes:
       - logs_data:/app/logs
     depends_on:
@@ -110,9 +109,10 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_URL: "postgresql://${POSTGRES_USER:-smp_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-session_manager}"
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-smuser}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-session_manager}"
     volumes:
       - backup_data:/app/backups
+      - logs_data:/app/logs
     depends_on:
       postgres:
         condition: service_healthy
@@ -123,6 +123,8 @@ services:
     build:
       context: ./web
       dockerfile: Dockerfile
+      args:
+        REACT_APP_API_URL: ""
     container_name: smp_web
     restart: unless-stopped
     networks:
@@ -134,10 +136,13 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
+      - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx_logs:/var/log/nginx
     depends_on:
-      - api
+      api:
+        condition: service_healthy
       - web
     networks:
       - smp_net
@@ -147,6 +152,7 @@ volumes:
   redis_data:
   logs_data:
   backup_data:
+  nginx_logs:
 
 networks:
   smp_net:
