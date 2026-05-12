@@ -1,292 +1,396 @@
 import asyncio
 import os
-import logging
 import json
+import logging
 import random
-import time
+import re
 from datetime import datetime, timedelta
+
 import asyncpg
 import aioredis
-from telethon import TelegramClient
+from telethon import TelegramClient, errors
 from telethon.sessions import StringSession
-from telethon.errors import (
-    FloodWaitError, UserBannedInChannelError, ChannelPrivateError,
-    InviteHashExpiredError, UserAlreadyParticipantError, SessionRevokedError,
-    AuthKeyUnregisteredError, PhoneNumberBannedError
+from telethon.network.connection import ConnectionTcpMTProxyRandomizedIntermediate
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
-from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+logger = logging.getLogger("worker")
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
-
-DB_URL = os.getenv("DATABASE_URL")
-REDIS_URL = os.getenv("REDIS_URL")
+DATABASE_URL = os.getenv("DATABASE_URL")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
-MAX_SESSIONS = int(os.getenv("MAX_SESSIONS_PER_WORKER", "500"))
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").encode()[:32].ljust(32, b"0")
 
-db_pool = None
-redis = None
-
-async def init():
-    global db_pool, redis
-    db_pool = await asyncpg.create_pool(DB_URL, min_size=3, max_size=10)
-    redis = await aioredis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
-    logger.info("✅ Worker initialized")
-
-async def get_random_proxy():
-    row = await db_pool.fetchrow("SELECT * FROM proxies WHERE is_active = TRUE ORDER BY RANDOM() LIMIT 1")
-    if not row: return None
-    return dict(row)
-
-async def decrypt_session_string(encrypted: str) -> str:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+# ─── رمزگشایی سشن ───────────────────────────────────────────
+def decrypt_session(encrypted: str) -> str:
     import base64
-    key = os.getenv("ENCRYPTION_KEY", "").encode()[:32].ljust(32)
-    aesgcm = AESGCM(key)
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     raw = base64.b64decode(encrypted)
     nonce, ct = raw[:12], raw[12:]
+    aesgcm = AESGCM(ENCRYPTION_KEY)
     return aesgcm.decrypt(nonce, ct, None).decode()
 
-async def log_session_event(session_id, event, details=None):
-    await db_pool.execute(
-        "INSERT INTO session_logs (session_id, event, details) VALUES ($1, $2, $3)",
-        session_id, event, json.dumps(details) if details else None
-    )
+# ─── اتصال به دیتابیس و Redis ───────────────────────────────
+_pool = None
+_redis = None
 
-async def update_session_status(session_id, status, error_count_inc=0):
-    await db_pool.execute(
-        "UPDATE sessions SET status = $1, error_count = error_count + $2, last_checked = NOW() WHERE id = $3",
-        status, error_count_inc, session_id
-    )
+async def get_pool():
+    global _pool
+    if not _pool:
+        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    return _pool
 
-async def join_channel(client: TelegramClient, target: str, target_type: str):
-    try:
-        if target_type == "link" and "t.me/+" in target:
-            hash_val = target.split("t.me/+")[1]
-            await client(ImportChatInviteRequest(hash_val))
-        elif target_type == "link" and "t.me/joinchat/" in target:
-            hash_val = target.split("joinchat/")[1]
-            await client(ImportChatInviteRequest(hash_val))
-        else:
-            entity = await client.get_entity(target)
-            await client(JoinChannelRequest(entity))
-        return True, None
-    except UserAlreadyParticipantError:
-        return True, "already_member"
-    except FloodWaitError as e:
-        return False, f"flood:{e.seconds}"
-    except (ChannelPrivateError, InviteHashExpiredError) as e:
-        return False, f"access_error:{type(e).__name__}"
-    except (SessionRevokedError, AuthKeyUnregisteredError, PhoneNumberBannedError) as e:
-        return False, f"session_dead:{type(e).__name__}"
-    except Exception as e:
-        return False, str(e)
+async def get_redis():
+    global _redis
+    if not _redis:
+        _redis = await aioredis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+    return _redis
 
-async def leave_channel(client: TelegramClient, target: str):
-    try:
-        entity = await client.get_entity(target)
-        await client(LeaveChannelRequest(entity))
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-async def process_session(task_id, session_id, session_data, target, target_type, action, delay_min, delay_max):
-    proxy = await get_random_proxy()
-    proxy_config = None
-    if proxy:
-        proxy_config = (proxy["proxy_type"], proxy["host"], proxy["port"],
-                       True, proxy.get("username"), proxy.get("password"))
-
-    try:
-        session_str = await decrypt_session_string(session_data["session_string"])
-        client = TelegramClient(
-            StringSession(session_str),
-            session_data.get("api_id") or API_ID,
-            session_data.get("api_hash") or API_HASH,
-            proxy=proxy_config,
-            connection_retries=2,
-            timeout=30
+# ─── انتخاب پروکسی رندوم ────────────────────────────────────
+async def get_random_proxy():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, host, port, proxy_type, username, password "
+            "FROM proxies WHERE is_active=TRUE "
+            "ORDER BY RANDOM() LIMIT 1"
         )
-        await client.connect()
+    return dict(row) if row else None
 
-        if not await client.is_user_authorized():
-            await update_session_status(session_id, "logged_out")
-            await log_session_event(session_id, "logged_out", {"task_id": str(task_id)})
-            await db_pool.execute(
-                "UPDATE task_sessions SET status = 'failed', error = $1 WHERE task_id = $2 AND session_id = $3",
-                "session_not_authorized", task_id, session_id
+def build_proxy(proxy_row: dict):
+    """ساخت tuple پروکسی برای Telethon"""
+    if not proxy_row:
+        return None
+    import socks
+    proxy_type_map = {
+        "socks5": socks.SOCKS5,
+        "socks4": socks.SOCKS4,
+        "http": socks.HTTP,
+    }
+    ptype = proxy_type_map.get(proxy_row["proxy_type"].lower(), socks.SOCKS5)
+    return (ptype, proxy_row["host"], proxy_row["port"],
+            True, proxy_row.get("username"), proxy_row.get("password"))
+
+# ─── لاگ رویداد سشن ─────────────────────────────────────────
+async def log_session_event(session_id: str, event: str, details: dict = None):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO session_logs (session_id, event, details) VALUES ($1,$2,$3)",
+            session_id, event, json.dumps(details or {})
+        )
+
+# ─── بروزرسانی وضعیت سشن ────────────────────────────────────
+async def update_session_status(session_id: str, status: str, flood_until=None):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if flood_until:
+            await conn.execute(
+                "UPDATE sessions SET status=$1, flood_until=$2, updated_at=NOW() WHERE id=$3",
+                status, flood_until, session_id
             )
-            return False
-
-        if action == "join":
-            success, error = await join_channel(client, target, target_type)
         else:
-            success, error = await leave_channel(client, target)
+            await conn.execute(
+                "UPDATE sessions SET status=$1, updated_at=NOW() WHERE id=$2",
+                status, session_id
+            )
 
-        await client.disconnect()
+async def increment_error(session_id: str):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE sessions SET error_count=error_count+1, updated_at=NOW() "
+            "WHERE id=$1 RETURNING error_count",
+            session_id
+        )
+        return row["error_count"] if row else 0
 
-        if success:
-            await db_pool.execute(
-                "UPDATE task_sessions SET status = 'joined', joined_at = NOW() WHERE task_id = $1 AND session_id = $2",
+# ─── بروزرسانی وضعیت task_sessions ─────────────────────────
+async def update_task_session(task_id: str, session_id: str, status: str, error: str = None):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if status == "joined":
+            await conn.execute(
+                "INSERT INTO task_sessions (task_id, session_id, status, joined_at) "
+                "VALUES ($1,$2,'joined',NOW()) ON CONFLICT (task_id, session_id) "
+                "DO UPDATE SET status='joined', joined_at=NOW()",
                 task_id, session_id
             )
-            await db_pool.execute(
-                "UPDATE sessions SET last_used = NOW() WHERE id = $1", session_id
+            await conn.execute(
+                "UPDATE tasks SET sessions_done=sessions_done+1 WHERE id=$1", task_id
             )
-            await db_pool.execute(
-                "UPDATE tasks SET sessions_done = sessions_done + 1 WHERE id = $1", task_id
-            )
-            await log_session_event(session_id, f"{action}_success", {"task_id": str(task_id), "target": target})
         else:
-            if error and error.startswith("flood:"):
-                wait_secs = int(error.split(":")[1])
-                flood_until = datetime.utcnow() + timedelta(seconds=wait_secs * 1.5)
-                await db_pool.execute(
-                    "UPDATE sessions SET status = 'flood', flood_until = $1 WHERE id = $2",
-                    flood_until, session_id
-                )
-                await log_session_event(session_id, "flood_wait", {"seconds": wait_secs})
-            elif error and "session_dead" in error:
-                status = "deleted" if "Revoked" in error else "logged_out"
-                await update_session_status(session_id, status)
-                await log_session_event(session_id, status, {"error": error})
-            else:
-                await update_session_status(session_id, "active", error_count_inc=1)
-
-            await db_pool.execute(
-                "UPDATE task_sessions SET status = 'failed', error = $1 WHERE task_id = $2 AND session_id = $3",
-                error, task_id, session_id
+            await conn.execute(
+                "INSERT INTO task_sessions (task_id, session_id, status, error) "
+                "VALUES ($1,$2,'failed',$3) ON CONFLICT (task_id, session_id) "
+                "DO UPDATE SET status='failed', error=$3",
+                task_id, session_id, error
             )
-            await db_pool.execute(
-                "UPDATE tasks SET sessions_failed = sessions_failed + 1 WHERE id = $1", task_id
+            await conn.execute(
+                "UPDATE tasks SET sessions_failed=sessions_failed+1 WHERE id=$1", task_id
             )
 
-        delay = random.uniform(delay_min, delay_max)
-        await asyncio.sleep(delay)
-        return success
+# ─── join یک سشن به یک گروه/کانال ──────────────────────────
+async def join_target(session_row: dict, task: dict) -> bool:
+    session_id = str(session_row["id"])
+    task_id = task["task_id"]
+    target = task["target"]
 
+    try:
+        session_str = decrypt_session(session_row["session_data"])
     except Exception as e:
-        logger.error(f"Session {session_id} error: {e}")
-        await update_session_status(session_id, "error", error_count_inc=1)
+        logger.error(f"Decrypt error for {session_row['phone']}: {e}")
+        await update_session_status(session_id, "error")
+        await update_task_session(task_id, session_id, "failed", f"decrypt_error: {e}")
         return False
 
-async def process_task(task_data: dict):
-    task_id = task_data["task_id"]
-    task = await db_pool.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
-    if not task or task["status"] in ("cancelled", "completed"):
-        return
+    proxy_row = await get_random_proxy()
+    proxy = build_proxy(proxy_row)
 
-    await db_pool.execute("UPDATE tasks SET status = 'running', started_at = NOW() WHERE id = $1", task_id)
-    logger.info(f"🚀 Processing task {task_id}: {task['type']} -> {task['target']}")
+    api_id = session_row.get("api_id") or API_ID
+    api_hash = session_row.get("api_hash") or API_HASH
 
-    sessions = await db_pool.fetch(
-        """SELECT s.id, s.session_string, s.api_id, s.api_hash
-           FROM task_sessions ts JOIN sessions s ON s.id = ts.session_id
-           WHERE ts.task_id = $1 AND ts.status = 'pending' AND s.status = 'active'""",
-        task_id
+    if not api_id or not api_hash:
+        logger.warning(f"No API credentials for {session_row['phone']}")
+        await update_task_session(task_id, session_id, "failed", "no_api_credentials")
+        return False
+
+    client = TelegramClient(
+        StringSession(session_str),
+        api_id, api_hash,
+        proxy=proxy,
+        connection_retries=2,
+        timeout=30,
+        request_retries=2
     )
 
-    semaphore = asyncio.Semaphore(min(50, len(sessions)))
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            logger.warning(f"Session logged out: {session_row['phone']}")
+            await update_session_status(session_id, "logged_out")
+            await update_task_session(task_id, session_id, "failed", "logged_out")
+            await log_session_event(session_id, "logged_out", {"task_id": task_id})
+            return False
 
-    async def process_with_semaphore(session):
-        async with semaphore:
-            current_task = await db_pool.fetchrow("SELECT status FROM tasks WHERE id = $1", task_id)
-            if current_task["status"] in ("cancelled", "paused"):
-                return
-            await process_session(
-                task_id, session["id"], dict(session),
-                task["target"], task["target_type"], task["type"],
-                task["join_delay_min"], task["join_delay_max"]
-            )
-
-    await asyncio.gather(*[process_with_semaphore(s) for s in sessions])
-
-    final = await db_pool.fetchrow("SELECT status FROM tasks WHERE id = $1", task_id)
-    if final["status"] == "running":
-        await db_pool.execute(
-            "UPDATE tasks SET status = 'completed', completed_at = NOW() WHERE id = $1", task_id
+        # join
+        await client.get_entity(target)
+        await client(
+            __import__("telethon.tl.functions.channels", fromlist=["JoinChannelRequest"]).JoinChannelRequest(target)
         )
-    logger.info(f"✅ Task {task_id} completed")
+        await update_session_status(session_id, "active")
+        await update_task_session(task_id, session_id, "joined")
+        await log_session_event(session_id, "joined", {"target": target, "task_id": task_id})
 
-    # Schedule auto-leave if needed
-    if task["auto_leave_after"]:
-        leave_at = datetime.utcnow() + timedelta(minutes=task["auto_leave_after"])
-        await redis.zadd("tasks:auto_leave", {str(task_id): leave_at.timestamp()})
+        # خروج خودکار
+        if task.get("auto_leave_after"):
+            await asyncio.sleep(task["auto_leave_after"] * 60)
+            try:
+                await client(
+                    __import__("telethon.tl.functions.channels", fromlist=["LeaveChannelRequest"]).LeaveChannelRequest(target)
+                )
+                await log_session_event(session_id, "left", {"target": target, "task_id": task_id})
+            except Exception:
+                pass
 
-async def check_auto_leave():
-    while True:
+        return True
+
+    except errors.FloodWaitError as e:
+        wait = e.seconds
+        flood_until = datetime.utcnow() + timedelta(seconds=wait)
+        logger.warning(f"FloodWait {wait}s for {session_row['phone']}")
+        await update_session_status(session_id, "flood", flood_until)
+        await update_task_session(task_id, session_id, "failed", f"flood_wait_{wait}s")
+        await log_session_event(session_id, "flood", {"wait": wait, "task_id": task_id})
+        return False
+
+    except errors.UserBannedInChannelError:
+        await update_session_status(session_id, "banned")
+        await update_task_session(task_id, session_id, "failed", "banned_in_channel")
+        await log_session_event(session_id, "banned", {"target": target})
+        return False
+
+    except errors.ChannelPrivateError:
+        await update_task_session(task_id, session_id, "failed", "channel_private")
+        return False
+
+    except errors.UserDeactivatedBanError:
+        await update_session_status(session_id, "deleted")
+        await update_task_session(task_id, session_id, "failed", "account_deleted")
+        await log_session_event(session_id, "deleted", {})
+        return False
+
+    except errors.PhoneNumberBannedError:
+        await update_session_status(session_id, "banned")
+        await update_task_session(task_id, session_id, "failed", "phone_banned")
+        await log_session_event(session_id, "banned", {"reason": "phone_banned"})
+        return False
+
+    except Exception as e:
+        err_str = str(e)[:200]
+        logger.error(f"Join error for {session_row['phone']}: {err_str}")
+        error_count = await increment_error(session_id)
+        if error_count >= 5:
+            await update_session_status(session_id, "error")
+        await update_task_session(task_id, session_id, "failed", err_str)
+        return False
+
+    finally:
         try:
-            now = datetime.utcnow().timestamp()
-            tasks = await redis.zrangebyscore("tasks:auto_leave", 0, now)
-            for task_id in tasks:
-                task = await db_pool.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
-                if task:
-                    leave_task = {
-                        "task_id": str(task_id) + "_leave",
-                        "type": "leave",
-                        "target": task["target"],
-                        "target_type": task["target_type"],
-                        "session_count": task["session_count"],
-                        "priority": 5
-                    }
-                    await redis.lpush("tasks:queue", json.dumps(leave_task))
-                await redis.zrem("tasks:auto_leave", task_id)
-        except Exception as e:
-            logger.error(f"Auto-leave check error: {e}")
-        await asyncio.sleep(60)
+            await client.disconnect()
+        except Exception:
+            pass
 
-async def check_session_health():
-    while True:
-        try:
-            interval = int((await db_pool.fetchrow("SELECT value FROM settings WHERE key = 'check_interval_minutes'"))["value"])
-            sessions = await db_pool.fetch(
-                "SELECT id, session_string, api_id, api_hash FROM sessions WHERE status = 'active' AND (last_checked IS NULL OR last_checked < NOW() - INTERVAL '1 minute' * $1) LIMIT 100",
-                interval
+# ─── پردازش یک تسک join ─────────────────────────────────────
+async def process_join_task(task: dict):
+    task_id = task["task_id"]
+    pool = await get_pool()
+
+    logger.info(f"Processing task {task_id[:8]} — target: {task['target']} — count: {task['session_count']}")
+
+    # بروزرسانی وضعیت تسک به running
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE tasks SET status='running', started_at=NOW() WHERE id=$1 AND status IN ('pending')",
+            task_id
+        )
+
+    # دریافت سشن‌های فعال
+    async with pool.acquire() as conn:
+        sessions = await conn.fetch(
+            "SELECT id, phone, session_data, api_id, api_hash "
+            "FROM sessions WHERE status='active' "
+            "ORDER BY RANDOM() LIMIT $1",
+            task["session_count"]
+        )
+
+    if not sessions:
+        logger.warning(f"No active sessions for task {task_id[:8]}")
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE tasks SET status='failed' WHERE id=$1", task_id)
+        return
+
+    success = 0
+    failed = 0
+    delay_min = task.get("join_delay_min", 3)
+    delay_max = task.get("join_delay_max", 8)
+
+    for session_row in sessions:
+        # بررسی لغو/توقف تسک
+        async with pool.acquire() as conn:
+            status_row = await conn.fetchrow("SELECT status FROM tasks WHERE id=$1", task_id)
+        if status_row and status_row["status"] in ("cancelled", "paused"):
+            logger.info(f"Task {task_id[:8]} {status_row['status']}, stopping")
+            break
+
+        result = await join_target(dict(session_row), task)
+        if result:
+            success += 1
+        else:
+            failed += 1
+
+        # تأخیر رندوم بین join‌ها
+        delay = random.uniform(delay_min, delay_max)
+        await asyncio.sleep(delay)
+
+    # وضعیت نهایی تسک
+    async with pool.acquire() as conn:
+        current = await conn.fetchrow("SELECT status FROM tasks WHERE id=$1", task_id)
+        if current and current["status"] == "running":
+            final_status = "completed" if failed == 0 or success > 0 else "failed"
+            await conn.execute(
+                "UPDATE tasks SET status=$1, completed_at=NOW() WHERE id=$2",
+                final_status, task_id
             )
-            for session in sessions:
-                try:
-                    session_str = await decrypt_session_string(session["session_string"])
-                    client = TelegramClient(
-                        StringSession(session_str),
-                        session.get("api_id") or API_ID,
-                        session.get("api_hash") or API_HASH,
-                        connection_retries=1, timeout=15
+
+    logger.info(f"Task {task_id[:8]} done — success: {success}, failed: {failed}")
+
+# ─── بررسی سلامت سشن‌ها ─────────────────────────────────────
+async def health_check_sessions():
+    pool = await get_pool()
+    logger.info("Starting session health check...")
+    async with pool.acquire() as conn:
+        # رفع flood منقضی‌شده
+        await conn.execute(
+            "UPDATE sessions SET status='active', flood_until=NULL "
+            "WHERE status='flood' AND flood_until < NOW()"
+        )
+        # سشن‌هایی که مدت زیادی بررسی نشدن
+        sessions = await conn.fetch(
+            "SELECT id, phone, session_data, api_id, api_hash FROM sessions "
+            "WHERE status='active' AND (last_checked IS NULL OR last_checked < NOW() - INTERVAL '30 minutes') "
+            "LIMIT 50"
+        )
+
+    checked = 0
+    for s in sessions:
+        try:
+            session_str = decrypt_session(s["session_data"])
+            api_id = s.get("api_id") or API_ID
+            api_hash = s.get("api_hash") or API_HASH
+            if not api_id or not api_hash:
+                continue
+            client = TelegramClient(StringSession(session_str), api_id, api_hash, connection_retries=1, timeout=15)
+            await client.connect()
+            is_auth = await client.is_user_authorized()
+            await client.disconnect()
+            async with pool.acquire() as conn:
+                if is_auth:
+                    await conn.execute(
+                        "UPDATE sessions SET last_checked=NOW() WHERE id=$1", str(s["id"])
                     )
-                    await client.connect()
-                    authorized = await client.is_user_authorized()
-                    await client.disconnect()
-                    if not authorized:
-                        await update_session_status(session["id"], "logged_out")
-                        await log_session_event(session["id"], "health_check_failed", {"reason": "not_authorized"})
-                    else:
-                        await db_pool.execute("UPDATE sessions SET last_checked = NOW() WHERE id = $1", session["id"])
-                except (SessionRevokedError, AuthKeyUnregisteredError):
-                    await update_session_status(session["id"], "deleted")
-                    await log_session_event(session["id"], "deleted", {"reason": "session_revoked"})
-                except Exception as e:
-                    logger.debug(f"Health check error for {session['id']}: {e}")
-                await asyncio.sleep(1)
+                else:
+                    await conn.execute(
+                        "UPDATE sessions SET status='logged_out', last_checked=NOW() WHERE id=$1", str(s["id"])
+                    )
+            checked += 1
+            await asyncio.sleep(2)
+        except errors.FloodWaitError as e:
+            await asyncio.sleep(min(e.seconds, 60))
+        except Exception as e:
+            logger.debug(f"Health check error for {s['phone']}: {e}")
+
+    logger.info(f"Health check done — checked {checked} sessions")
+
+# ─── حلقه اصلی worker ───────────────────────────────────────
+async def task_worker():
+    redis = await get_redis()
+    logger.info("Task worker started, waiting for jobs...")
+    while True:
+        try:
+            # بررسی صف با timeout
+            item = await redis.brpop("tasks:join", timeout=5)
+            if not item:
+                continue
+            _, data = item
+            task = json.loads(data)
+            await process_join_task(task)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Worker loop error: {e}")
+            await asyncio.sleep(5)
+
+async def health_check_loop():
+    interval = int(os.getenv("CHECK_INTERVAL_MINUTES", "30")) * 60
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await health_check_sessions()
         except Exception as e:
             logger.error(f"Health check loop error: {e}")
-        await asyncio.sleep(300)
 
 async def main():
-    await init()
-    logger.info("🤖 Worker started, listening for tasks...")
-    asyncio.create_task(check_auto_leave())
-    asyncio.create_task(check_session_health())
-
-    while True:
-        try:
-            result = await redis.brpop("tasks:queue", timeout=5)
-            if result:
-                task_data = json.loads(result[1])
-                asyncio.create_task(process_task(task_data))
-        except Exception as e:
-            logger.error(f"Queue error: {e}")
-            await asyncio.sleep(5)
+    logger.info("🚀 Worker starting...")
+    await get_pool()
+    await get_redis()
+    await asyncio.gather(
+        task_worker(),
+        health_check_loop()
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
