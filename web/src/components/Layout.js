@@ -1,78 +1,78 @@
 import React, { useState } from "react";
 import { Outlet, NavLink, useNavigate } from "react-router-dom";
 
-const navItems = [
-  { path: "/", label: "📊 داشبورد", exact: true },
-  { path: "/sessions", label: "📱 سشن‌ها" },
-  { path: "/tasks", label: "📋 تسک‌ها" },
-  { path: "/orders", label: "💰 سفارشات" },
-  { path: "/users", label: "👥 کاربران" },
-  { path: "/proxies", label: "🌐 پروکسی‌ها" },
-  { path: "/settings", label: "⚙️ تنظیمات" },
+const NAV = [
+  { to: "/",          icon: "📊", label: "داشبورد",    end: true },
+  { to: "/sessions",  icon: "📱", label: "سشن‌ها" },
+  { to: "/tasks",     icon: "📋", label: "تسک‌ها" },
+  { to: "/orders",    icon: "💰", label: "سفارشات" },
+  { to: "/users",     icon: "👥", label: "کاربران" },
+  { to: "/proxies",   icon: "🌐", label: "پروکسی‌ها" },
+  { to: "/settings",  icon: "⚙️", label: "تنظیمات" },
 ];
 
 export default function Layout() {
+  const [open, setOpen] = useState(false);
   const navigate = useNavigate();
-  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const logout = () => {
     localStorage.removeItem("admin_token");
     navigate("/login");
   };
 
-  const closeSidebar = () => setSidebarOpen(false);
-
   return (
-    <div>
+    <div className="app-shell">
+      {/* Overlay */}
       <div
-        className={`overlay ${sidebarOpen ? "open" : ""}`}
-        onClick={closeSidebar}
+        className={`sidebar-overlay ${open ? "open" : ""}`}
+        onClick={() => setOpen(false)}
       />
-      <div className={`sidebar ${sidebarOpen ? "open" : ""}`}>
+
+      {/* Sidebar */}
+      <aside className={`sidebar ${open ? "open" : ""}`}>
         <div className="sidebar-logo">
           <h1>🤖 Session Manager</h1>
           <p>پنل مدیریت حرفه‌ای</p>
         </div>
+
         <nav className="sidebar-nav">
-          {navItems.map(item => (
+          {NAV.map(n => (
             <NavLink
-              key={item.path}
-              to={item.path}
-              end={item.exact}
+              key={n.to}
+              to={n.to}
+              end={n.end}
               className={({ isActive }) => `nav-item ${isActive ? "active" : ""}`}
-              onClick={closeSidebar}
+              onClick={() => setOpen(false)}
             >
-              {item.label}
+              <span className="icon">{n.icon}</span>
+              {n.label}
             </NavLink>
           ))}
         </nav>
-        <div style={{ padding: "16px 12px", borderTop: "1px solid #334155" }}>
-          <button
-            className="nav-item"
-            style={{ width: "100%", textAlign: "right" }}
-            onClick={logout}
-          >
-            🚪 خروج از سیستم
+
+        <div className="sidebar-footer">
+          <button className="nav-item" onClick={logout} style={{ color: "#ef4444" }}>
+            <span className="icon">🚪</span>
+            خروج از سیستم
           </button>
         </div>
-      </div>
-      <div className="main-content">
-        <div className="topbar">
-          <button
-            className="hamburger"
-            onClick={() => setSidebarOpen(!sidebarOpen)}
-            aria-label="منو"
-          >
-            ☰
-          </button>
-          <h2>Session Manager Pro</h2>
-          <span style={{ fontSize: "0.82rem", color: "#64748b", background: "#f1f5f9", padding: "4px 10px", borderRadius: "20px" }}>
-            پنل ادمین
-          </span>
-        </div>
-        <div className="page-content">
+      </aside>
+
+      {/* Main */}
+      <div className="main-wrap">
+        <header className="topbar">
+          <button className="hamburger" onClick={() => setOpen(o => !o)}>☰</button>
+          <span className="topbar-title">Session Manager Pro</span>
+          <div className="topbar-right">
+            <span style={{ fontSize: "0.78rem", color: "var(--text-3)" }}>
+              {new Date().toLocaleDateString("fa-IR")}
+            </span>
+          </div>
+        </header>
+
+        <main className="page-content">
           <Outlet />
-        </div>
+        </main>
       </div>
     </div>
   );
