@@ -18,7 +18,7 @@ export default function Proxies() {
   const [bulk, setBulk] = useState("");
 
   const { data, isLoading } = useQuery("proxies",
-    () => api.get("/proxies/").then(r=>r.data),
+    () => api.get("/api/proxies/").then(r=>r.data),
     { refetchInterval:30000, retry:1, onError:()=>{} }
   );
   const proxies = safe(data);
@@ -29,11 +29,11 @@ export default function Proxies() {
     return true;
   });
 
-  const addM = useMutation(d=>api.post("/proxies/",{...d,port:parseInt(d.port)}),
+  const addM = useMutation(d=>api.post("/api/proxies/",{...d,port:parseInt(d.port)}),
     { onSuccess:()=>{ qc.invalidateQueries("proxies"); toast.success("پروکسی اضافه شد"); setShowAdd(false); setForm({host:"",port:"",proxy_type:"socks5",username:"",password:"",country:""}); }, onError:e=>toast.error((e&&e.response&&e.response.data&&e.response.data.detail)||"خطا") });
-  const delM = useMutation(id=>api.delete("/proxies/"+id),
+  const delM = useMutation(id=>api.delete("/api/proxies/"+id),
     { onSuccess:()=>{ qc.invalidateQueries("proxies"); toast.success("حذف شد"); } });
-  const toggleM = useMutation(id=>api.patch("/proxies/"+id+"/toggle"),
+  const toggleM = useMutation(id=>api.patch("/api/proxies/"+id+"/toggle"),
     { onSuccess:()=>qc.invalidateQueries("proxies") });
 
   const handleBulk = () => {
@@ -51,7 +51,7 @@ export default function Proxies() {
       } catch(e) {}
     }
     if (!items.length) return toast.error("هیچ پروکسی معتبری یافت نشد");
-    api.post("/proxies/bulk",items)
+    api.post("/api/proxies/bulk",items)
       .then(res=>{ qc.invalidateQueries("proxies"); toast.success((res.data&&res.data.added||items.length)+" پروکسی اضافه شد"); setShowBulk(false); setBulk(""); })
       .catch(()=>toast.error("خطا در آپلود"));
   };
