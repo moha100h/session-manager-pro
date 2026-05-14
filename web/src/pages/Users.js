@@ -26,7 +26,7 @@ export default function Users() {
       if (search) p.set("search", search);
       p.set("page", page);
       p.set("limit", 20);
-      return api.get("/users/?" + p).then(r => r.data);
+      return api.get("/api/users/?" + p).then(r => r.data);
     },
     { keepPreviousData:true, refetchInterval:30000, retry:1, onError:()=>{} }
   );
@@ -37,7 +37,7 @@ export default function Users() {
 
   // stats از dashboard
   const { data: statsRaw } = useQuery("dash_stats",
-    () => api.get("/stats/dashboard").then(r => r.data),
+    () => api.get("/api/stats/dashboard").then(r => r.data),
     { refetchInterval:30000, retry:1, onError:()=>{} }
   );
   const userStats = statsRaw?.users || {};
@@ -46,7 +46,7 @@ export default function Users() {
 
   // backend: POST /users/{id}/balance → { amount: float } (فقط افزایش)
   const balM = useMutation(
-    ({id, amount}) => api.post("/users/" + id + "/balance", { amount: parseFloat(amount) }),
+    ({id, amount}) => api.post("/api/users/" + id + "/balance", { amount: parseFloat(amount) }),
     {
       onSuccess:(res)=>{
         qc.invalidateQueries("users");
@@ -62,7 +62,7 @@ export default function Users() {
 
   // backend: POST /users/{id}/ban → { reason: "" }
   const banM = useMutation(
-    ({id, reason=""}) => api.post("/users/" + id + "/ban", { reason }),
+    ({id, reason=""}) => api.post("/api/users/" + id + "/ban", { reason }),
     {
       onSuccess:()=>{ qc.invalidateQueries("users"); toast.success("کاربر بن شد"); setSel(s=>s?{...s,is_banned:true}:s); },
       onError: e => toast.error(e?.response?.data?.detail || "خطا")
@@ -71,7 +71,7 @@ export default function Users() {
 
   // backend: POST /users/{id}/unban
   const unbanM = useMutation(
-    id => api.post("/users/" + id + "/unban"),
+    id => api.post("/api/users/" + id + "/unban"),
     {
       onSuccess:()=>{ qc.invalidateQueries("users"); toast.success("✅ آنبن شد"); setSel(s=>s?{...s,is_banned:false}:s); },
       onError: e => toast.error(e?.response?.data?.detail || "خطا")
