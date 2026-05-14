@@ -20,8 +20,14 @@ export default function Layout() {
     navigate("/login");
   };
 
+  const closeSidebar = () => setSidebarOpen(false);
+
   return (
     <div>
+      <div
+        className={`overlay ${sidebarOpen ? "open" : ""}`}
+        onClick={closeSidebar}
+      />
       <div className={`sidebar ${sidebarOpen ? "open" : ""}`}>
         <div className="sidebar-logo">
           <h1>🤖 Session Manager</h1>
@@ -34,23 +40,35 @@ export default function Layout() {
               to={item.path}
               end={item.exact}
               className={({ isActive }) => `nav-item ${isActive ? "active" : ""}`}
-              onClick={() => setSidebarOpen(false)}
+              onClick={closeSidebar}
             >
               {item.label}
             </NavLink>
           ))}
         </nav>
         <div style={{ padding: "16px 12px", borderTop: "1px solid #334155" }}>
-          <button className="nav-item" style={{ width: "100%", background: "none", border: "none" }} onClick={logout}>
-            🚪 خروج
+          <button
+            className="nav-item"
+            style={{ width: "100%", textAlign: "right" }}
+            onClick={logout}
+          >
+            🚪 خروج از سیستم
           </button>
         </div>
       </div>
       <div className="main-content">
         <div className="topbar">
-          <button onClick={() => setSidebarOpen(!sidebarOpen)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: "1.5rem", display: "none" }}>☰</button>
+          <button
+            className="hamburger"
+            onClick={() => setSidebarOpen(!sidebarOpen)}
+            aria-label="منو"
+          >
+            ☰
+          </button>
           <h2>Session Manager Pro</h2>
-          <span style={{ fontSize: "0.85rem", color: "#64748b" }}>پنل ادمین</span>
+          <span style={{ fontSize: "0.82rem", color: "#64748b", background: "#f1f5f9", padding: "4px 10px", borderRadius: "20px" }}>
+            پنل ادمین
+          </span>
         </div>
         <div className="page-content">
           <Outlet />
