@@ -14,7 +14,7 @@ const SECTIONS = [
 
 // backend: GET /settings/ → { key: { value, description, updated_at } }
 const useSettings = () => useQuery("settings",
-  () => api.get("/settings/").then(r => {
+  () => api.get("/api/settings/").then(r => {
     // تبدیل به flat object: { key: value }
     const raw = r.data;
     if (!raw || typeof raw !== "object") return {};
@@ -39,7 +39,7 @@ export default function Settings() {
 
   // backend: GET /settings/plans
   const { data: plansRaw } = useQuery("plans",
-    () => api.get("/settings/plans").then(r => r.data),
+    () => api.get("/api/settings/plans").then(r => r.data),
     { retry:1, onError:()=>{} }
   );
   const plans = Array.isArray(plansRaw) ? plansRaw : [];
@@ -48,7 +48,7 @@ export default function Settings() {
   const saveSetting = async (key, value) => {
     setSaving(s => ({...s, [key]:true}));
     try {
-      await api.put("/settings/" + key, { value: String(value) });
+      await api.put("/api/settings/" + key, { value: String(value) });
       qc.invalidateQueries("settings");
       toast.success("✅ ذخیره شد");
       setEditing(ed => { const n={...ed}; delete n[key]; return n; });
@@ -62,7 +62,7 @@ export default function Settings() {
 
   // backend: POST /settings/plans با { name_fa, name_en, session_count, price_usd, duration_days, is_active, sort_order }
   const createPlanM = useMutation(
-    d => api.post("/settings/plans", {
+    d => api.post("/api/settings/plans", {
       name_fa: d.name_fa,
       name_en: d.name_en || d.name_fa,
       session_count: parseInt(d.session_count),
@@ -77,14 +77,14 @@ export default function Settings() {
 
   // backend: DELETE /settings/plans/{id}
   const delPlanM = useMutation(
-    id => api.delete("/settings/plans/" + id),
+    id => api.delete("/api/settings/plans/" + id),
     { onSuccess:()=>{ qc.invalidateQueries("plans"); toast.success("حذف شد"); },
       onError:e=>toast.error(e?.response?.data?.detail||"خطا") }
   );
 
   // backend: PUT /settings/plans/{id}
   const togglePlanM = useMutation(
-    p => api.put("/settings/plans/" + p.id, { is_active: !p.is_active }),
+    p => api.put("/api/settings/plans/" + p.id, { is_active: !p.is_active }),
     { onSuccess:()=>qc.invalidateQueries("plans"),
       onError:e=>toast.error(e?.response?.data?.detail||"خطا") }
   );
