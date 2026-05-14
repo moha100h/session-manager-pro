@@ -105,7 +105,7 @@ export default function Users() {
                   </span>
                 </div>
               </div>
-              <div style={{ display: "flex", gap: 6", flexWrap: "wrap" }}>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                 <button className="btn btn-success btn-sm" onClick={() => { setSelUser(u); setBalAmt(""); setBalType("add"); }}>💰 شارژ</button>
                 {u.is_banned
                   ? <button className="btn btn-primary btn-sm" onClick={() => unbanM.mutate(u.id)}>🔓 آنبن</button>
