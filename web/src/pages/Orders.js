@@ -36,14 +36,14 @@ export default function Orders() {
       if (status) p.set("status", status);
       p.set("page", page);
       p.set("limit", 20);
-      return api.get("/orders/?" + p).then(r => r.data);
+      return api.get("/api/orders/?" + p).then(r => r.data);
     },
     { keepPreviousData:true, refetchInterval:20000, retry:1, onError:()=>{} }
   );
   const orders = safe(data);
 
   const { data: statsRaw } = useQuery("dash_stats",
-    () => api.get("/stats/dashboard").then(r => r.data),
+    () => api.get("/api/stats/dashboard").then(r => r.data),
     { refetchInterval:30000, retry:1, onError:()=>{} }
   );
   const ot = statsRaw?.orders_today || {};
@@ -51,7 +51,7 @@ export default function Orders() {
 
   // backend: POST /orders/{id}/confirm
   const confirmM = useMutation(
-    id => api.post("/orders/" + id + "/confirm"),
+    id => api.post("/api/orders/" + id + "/confirm"),
     {
       onSuccess: (res) => {
         qc.invalidateQueries("orders");
@@ -65,7 +65,7 @@ export default function Orders() {
 
   // backend: POST /orders/{id}/reject → { admin_note: "" }
   const rejectM = useMutation(
-    ({id, admin_note}) => api.post("/orders/" + id + "/reject", { admin_note }),
+    ({id, admin_note}) => api.post("/api/orders/" + id + "/reject", { admin_note }),
     {
       onSuccess: () => {
         qc.invalidateQueries("orders");
