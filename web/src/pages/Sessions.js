@@ -45,7 +45,7 @@ export default function Sessions() {
       if (status) p.set("status", status);
       if (search) p.set("search", search);
       p.set("page", page); p.set("limit", 20);
-      return api.get("/sessions/?" + p).then(r => r.data);
+      return api.get("/api/sessions/?" + p).then(r => r.data);
     },
     { keepPreviousData:true, refetchInterval:15000, retry:1, onError:()=>{} }
   );
@@ -54,14 +54,14 @@ export default function Sessions() {
   const totalPages = Math.max(1, Math.ceil(total / 20));
 
   const { data: statsRaw } = useQuery("sess_stats",
-    () => api.get("/stats/dashboard").then(r => r.data && r.data.sessions ? r.data.sessions : {}),
+    () => api.get("/api/stats/dashboard").then(r => r.data && r.data.sessions ? r.data.sessions : {}),
     { refetchInterval:20000, retry:1, onError:()=>{} }
   );
   const stats = (statsRaw && typeof statsRaw==="object") ? statsRaw : {};
 
-  const delM   = useMutation(id => api.delete("/sessions/"+id),
+  const delM   = useMutation(id => api.delete("/api/sessions/"+id),
     { onSuccess:()=>{ qc.invalidateQueries("sessions"); toast.success("سشن حذف شد"); setSel(null); } });
-  const reactM = useMutation(id => api.post("/sessions/"+id+"/reactivate"),
+  const reactM = useMutation(id => api.post("/api/sessions/"+id+"/reactivate"),
     { onSuccess:()=>{ qc.invalidateQueries("sessions"); toast.success("فعال‌سازی شد"); setSel(null); } });
 
   const resetAdd = () => { setFiles([]); setSessStr(""); setSessPhone(""); setBulkText(""); setUploading(false); };
@@ -75,7 +75,7 @@ export default function Sessions() {
       try {
         const fd = new FormData();
         fd.append("file", file);
-        await api.post("/sessions/upload", fd, { headers:{ "Content-Type":"multipart/form-data" } });
+        await api.post("/api/sessions/upload", fd, { headers:{ "Content-Type":"multipart/form-data" } });
         ok++;
       } catch(e) {
         fail++;
@@ -91,7 +91,7 @@ export default function Sessions() {
     if (!sessStr.trim()) return toast.error("Session String خالی است");
     setUploading(true);
     try {
-      await api.post("/sessions/add-string", { session_string: sessStr.trim(), phone: sessPhone.trim()||null });
+      await api.post("/api/sessions/add-string", { session_string: sessStr.trim(), phone: sessPhone.trim()||null });
       toast.success("سشن اضافه شد");
       qc.invalidateQueries("sessions");
       closeAdd();
@@ -107,7 +107,7 @@ export default function Sessions() {
     setUploading(true);
     let ok = 0, fail = 0;
     for (const line of lines) {
-      try { await api.post("/sessions/add-string", { session_string: line }); ok++; }
+      try { await api.post("/api/sessions/add-string", { session_string: line }); ok++; }
       catch(e) { fail++; }
     }
     setUploading(false);
