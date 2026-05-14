@@ -56,7 +56,7 @@ function UserCard({ user, onBalance, onBan, onUnban }) {
         </div>
       </div>
 
-      <div style={{ display: "flex", gap: 8", flexWrap: "wrap" }}>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
         <button className="btn btn-success btn-sm" onClick={() => onBalance(user)}>
           💰 شارژ
         </button>
