@@ -315,8 +315,7 @@ export default function Sessions() {
                   <p style={{ fontSize:12, color:"#92400e", fontWeight:600 }}>هر خط = یک Session String</p>
                 </div>
                 <textarea rows={8} value={bulkText} onChange={e=>setBulkText(e.target.value)}
-                  placeholder={"1BQANOTEuMTg1LjE3Ni43MwO...
-1BQANOTEuMTg1LjE3Ni43MwO..."}
+                  placeholder="1BQANOTEuMTg1LjE3Ni43MwO..."
                   style={{ width:"100%", padding:"10px 12px", border:"1.5px solid #e2e8f0", borderRadius:8, fontFamily:"monospace", fontSize:12, outline:"none", resize:"vertical", direction:"ltr", marginBottom:8 }} />
                 <p style={{ fontSize:12, color:"#94a3b8", marginBottom:14 }}>
                   {bulkText.trim().split("\n").filter(l=>l.trim()).length} سشن آماده
