@@ -22,7 +22,7 @@ const StatCard = ({ icon, label, value, sub, color="#6366f1" }) => (
 export default function Dashboard() {
   const { data, isLoading, error } = useQuery(
     "dash_stats",
-    () => api.get("/stats/dashboard").then(r => r.data),
+    () => api.get("/api/stats/dashboard").then(r => r.data),
     { refetchInterval:30000, retry:2, onError:()=>{} }
   );
 
