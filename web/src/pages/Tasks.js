@@ -32,7 +32,7 @@ export default function Tasks() {
 
   const { data, isLoading } = useQuery(
     ["tasks", status, page],
-    () => { const p = new URLSearchParams(); if(status) p.set("status",status); p.set("page",page); p.set("limit",20); return api.get("/tasks/?"+p).then(r=>r.data); },
+    () => { const p = new URLSearchParams(); if(status) p.set("status",status); p.set("page",page); p.set("limit",20); return api.get("/api/tasks/?"+p).then(r=>r.data); },
     { keepPreviousData:true, refetchInterval:10000, retry:1, onError:()=>{} }
   );
   const tasks = safe(data) || safe(data && data.tasks);
@@ -40,18 +40,18 @@ export default function Tasks() {
   const totalPages = Math.max(1, Math.ceil(total/20));
 
   const { data: statsRaw } = useQuery("task_stats2",
-    () => api.get("/stats/dashboard").then(r => r.data && r.data.tasks ? r.data.tasks : {}),
+    () => api.get("/api/stats/dashboard").then(r => r.data && r.data.tasks ? r.data.tasks : {}),
     { refetchInterval:15000, retry:1, onError:()=>{} }
   );
   const stats = (statsRaw && typeof statsRaw==="object") ? statsRaw : {};
 
   const createM = useMutation(
-    d => api.post("/tasks/", { ...d, session_count:parseInt(d.session_count)||1, delay_between:d.delay_between?parseInt(d.delay_between):null }),
+    d => api.post("/api/tasks/", { ...d, session_count:parseInt(d.session_count)||1, delay_between:d.delay_between?parseInt(d.delay_between):null }),
     { onSuccess:()=>{ qc.invalidateQueries("tasks"); toast.success("تسک ایجاد شد"); setShowCreate(false); setForm({task_type:"join_channel",target:"",session_count:"",delay_between:"",priority:"normal"}); }, onError:e=>toast.error((e&&e.response&&e.response.data&&e.response.data.detail)||"خطا") }
   );
-  const cancelM = useMutation(id=>api.post("/tasks/"+id+"/cancel"),
+  const cancelM = useMutation(id=>api.post("/api/tasks/"+id+"/cancel"),
     { onSuccess:()=>{ qc.invalidateQueries("tasks"); toast.success("لغو شد"); setSel(null); } });
-  const retryM = useMutation(id=>api.post("/tasks/"+id+"/retry"),
+  const retryM = useMutation(id=>api.post("/api/tasks/"+id+"/retry"),
     { onSuccess:()=>{ qc.invalidateQueries("tasks"); toast.success("در صف قرار گرفت"); setSel(null); } });
 
   const pct = (t) => num(t.total_count)>0 ? Math.round((num(t.success_count)/num(t.total_count))*100) : 0;
