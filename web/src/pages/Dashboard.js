@@ -1,39 +1,50 @@
 import React from "react";
 import { useQuery } from "react-query";
 import { useNavigate } from "react-router-dom";
-import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid } from "recharts";
 import api from "../api";
 
-const COLORS = ["#22c55e","#ef4444","#f59e0b","#6366f1","#06b6d4","#8b5cf6"];
 
-function StatCard({ icon, value, label, color, onClick }) {
+// ── shared helpers ──────────────────────────────────────────
+const C = {
+  card: { background:"#fff", borderRadius:12, border:"1px solid #e2e8f0", boxShadow:"0 2px 8px rgba(0,0,0,0.06)", padding:20, marginBottom:16 },
+  cardHeader: { display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16, flexWrap:"wrap", gap:8 },
+  cardTitle: { fontSize:15, fontWeight:700, color:"#0f172a" },
+  btn: (color="#6366f1",text="#fff") => ({ display:"inline-flex", alignItems:"center", gap:6, padding:"8px 16px", borderRadius:8, border:"none", cursor:"pointer", fontFamily:"inherit", fontSize:13, fontWeight:600, background:color, color:text, transition:"opacity 0.15s" }),
+  btnSm: (color="#6366f1",text="#fff") => ({ display:"inline-flex", alignItems:"center", gap:4, padding:"5px 12px", borderRadius:6, border:"none", cursor:"pointer", fontFamily:"inherit", fontSize:12, fontWeight:600, background:color, color:text }),
+  btnGhost: { display:"inline-flex", alignItems:"center", gap:6, padding:"7px 14px", borderRadius:8, border:"1px solid #e2e8f0", cursor:"pointer", fontFamily:"inherit", fontSize:13, fontWeight:600, background:"#fff", color:"#475569" },
+  badge: (bg,color) => ({ display:"inline-flex", alignItems:"center", gap:3, padding:"3px 10px", borderRadius:20, fontSize:11, fontWeight:700, background:bg, color:color, whiteSpace:"nowrap" }),
+  input: { width:"100%", padding:"9px 12px", border:"1.5px solid #e2e8f0", borderRadius:8, fontFamily:"inherit", fontSize:13, color:"#0f172a", background:"#fff", outline:"none" },
+  label: { display:"block", fontSize:12, fontWeight:600, color:"#475569", marginBottom:5 },
+  modal: { position:"fixed", inset:0, background:"rgba(15,23,42,0.5)", zIndex:200, display:"flex", alignItems:"center", justifyContent:"center", padding:16 },
+  modalBox: { background:"#fff", borderRadius:16, padding:24, width:"100%", maxWidth:460, maxHeight:"90vh", overflowY:"auto", boxShadow:"0 20px 60px rgba(0,0,0,0.2)", animation:"fadeIn 0.2s ease" },
+  loading: { textAlign:"center", padding:"48px 24px", color:"#94a3b8", fontSize:14 },
+  empty: { textAlign:"center", padding:"48px 24px", color:"#94a3b8" },
+  statCard: (color) => ({ background:"#fff", borderRadius:12, border:"1px solid #e2e8f0", padding:"16px 18px", position:"relative", overflow:"hidden", cursor:"default" }),
+};
+const safe = (v) => Array.isArray(v) ? v : [];
+const num = (v) => Number(v) || 0;
+
+
+function MiniBar({ value, max, color }) {
+  const pct = max > 0 ? Math.min(100, Math.round((value / max) * 100)) : 0;
   return (
-    <div className="stat-card" onClick={onClick} style={{ cursor: onClick ? "pointer" : "default" }}>
-      <div className="icon">{icon}</div>
-      <div className="value">{value ?? 0}</div>
-      <div className="label">{label}</div>
-      <div className="bar" style={{ background: color }} />
+    <div style={{ background:"#f1f5f9", borderRadius:6, height:8, overflow:"hidden", marginTop:6 }}>
+      <div style={{ width:`${pct}%`, height:"100%", background:color, borderRadius:6, transition:"width 0.6s ease" }} />
     </div>
   );
 }
 
-function QuickBtn({ icon, label, sub, color, onClick }) {
+function StatCard({ icon, value, label, color, sub, onClick }) {
   return (
-    <button className="quick-action" onClick={onClick}
-      style={{ borderColor: color + "30" }}
-      onMouseEnter={e => { e.currentTarget.style.borderColor = color; e.currentTarget.style.background = color + "08"; }}
-      onMouseLeave={e => { e.currentTarget.style.borderColor = color + "30"; e.currentTarget.style.background = ""; }}
-    >
-      <div style={{ width: 42, height: 42, borderRadius: 12, background: color + "18",
-        display: "flex", alignItems: "center", justifyContent: "center", fontSize: "1.3rem", flexShrink: 0 }}>
-        {icon}
-      </div>
-      <div style={{ flex: 1, textAlign: "right" }}>
-        <div style={{ fontWeight: 700, fontSize: "0.88rem", color: "var(--text)" }}>{label}</div>
-        <div style={{ fontSize: "0.75rem", color: "var(--text-3)", marginTop: 2 }}>{sub}</div>
-      </div>
-      <span style={{ color: "var(--text-3)" }}>‹</span>
-    </button>
+    <div onClick={onClick} style={{ ...C.statCard(color), cursor: onClick?"pointer":"default" }}
+      onMouseEnter={e => { if(onClick) e.currentTarget.style.transform="translateY(-2px)"; e.currentTarget.style.boxShadow="0 6px 20px rgba(0,0,0,0.1)"; }}
+      onMouseLeave={e => { e.currentTarget.style.transform=""; e.currentTarget.style.boxShadow=""; }}>
+      <div style={{ position:"absolute", top:0, left:0, right:0, height:3, background:color }} />
+      <div style={{ fontSize:22, marginBottom:8, marginTop:4 }}>{icon}</div>
+      <div style={{ fontSize:26, fontWeight:800, color:"#0f172a", lineHeight:1 }}>{value}</div>
+      <div style={{ fontSize:11, color:"#94a3b8", marginTop:5, fontWeight:500 }}>{label}</div>
+      {sub !== undefined && <MiniBar value={num(sub)} max={num(value)} color={color} />}
+    </div>
   );
 }
 
@@ -42,141 +53,153 @@ export default function Dashboard() {
   const { data, isLoading, refetch, isFetching } = useQuery(
     "dashboard",
     () => api.get("/stats/dashboard").then(r => r.data),
-    { refetchInterval: 30000, retry: 1 }
+    { refetchInterval: 30000, retry: 1, onError: () => {} }
   );
 
-  const s = data?.sessions || {};
-  const t = data?.tasks || {};
-  const o = data?.orders || {};
-  const u = data?.users || {};
+  const s = (data && typeof data === "object") ? (data.sessions || {}) : {};
+  const t = (data && typeof data === "object") ? (data.tasks || {}) : {};
+  const o = (data && typeof data === "object") ? (data.orders || {}) : {};
+  const u = (data && typeof data === "object") ? (data.users || {}) : {};
 
-  const total = Number(s.total || 0);
-  const active = Number(s.active || 0);
+  const total = num(s.total);
+  const active = num(s.active);
   const health = total > 0 ? Math.round((active / total) * 100) : 0;
-  const healthColor = health >= 70 ? "#22c55e" : health >= 40 ? "#f59e0b" : "#ef4444";
-
-  const pieData = [
-    { name: "فعال",    value: Number(s.active || 0) },
-    { name: "لاگ‌اوت", value: Number(s.logged_out || 0) },
-    { name: "فلود",    value: Number(s.flood || 0) },
-    { name: "بن",      value: Number(s.banned || 0) },
-    { name: "خطا",     value: Number(s.error || 0) },
-  ].filter(d => d.value > 0);
-
-  const barData = [
-    { name: "در صف",    value: Number(t.pending || 0) },
-    { name: "در حال اجرا", value: Number(t.running || 0) },
-    { name: "تکمیل",   value: Number(t.completed || 0) },
-    { name: "ناموفق",  value: Number(t.failed || 0) },
-  ];
+  const hColor = health >= 70 ? "#22c55e" : health >= 40 ? "#f59e0b" : "#ef4444";
 
   if (isLoading) return (
-    <div className="loading">
-      <div className="loading-spinner" />
-      در حال بارگذاری داشبورد...
+    <div style={C.loading}>
+      <div style={{ width:36, height:36, border:"3px solid #e2e8f0", borderTopColor:"#6366f1", borderRadius:"50%", animation:"spin 0.8s linear infinite", margin:"0 auto 12px" }} />
+      در حال بارگذاری...
     </div>
   );
 
   return (
-    <div>
+    <div style={{ animation:"fadeIn 0.3s ease" }}>
       {/* Header */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24, flexWrap: "wrap", gap: 10 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20, flexWrap:"wrap", gap:10 }}>
         <div>
-          <h2 style={{ fontSize: "1.3rem", fontWeight: 800 }}>📊 داشبورد</h2>
-          <p style={{ fontSize: "0.78rem", color: "var(--text-3)", marginTop: 2 }}>
-            آخرین بروزرسانی: {new Date().toLocaleTimeString("fa-IR")}
-          </p>
+          <h2 style={{ fontSize:20, fontWeight:800, color:"#0f172a" }}>📊 داشبورد</h2>
+          <p style={{ fontSize:11, color:"#94a3b8", marginTop:2 }}>آخرین بروزرسانی: {new Date().toLocaleTimeString("fa-IR")}</p>
         </div>
-        <button className="btn btn-ghost btn-sm" onClick={refetch} disabled={isFetching}>
-          <span style={{ display: "inline-block", animation: isFetching ? "spin 0.8s linear infinite" : "none" }}>🔄</span>
-          {isFetching ? "در حال بروزرسانی..." : "بروزرسانی"}
+        <button onClick={refetch} disabled={isFetching} style={{ ...C.btnGhost, opacity: isFetching ? 0.6 : 1 }}>
+          <span style={{ display:"inline-block", animation: isFetching ? "spin 0.8s linear infinite" : "none" }}>🔄</span>
+          {isFetching ? "..." : "بروزرسانی"}
         </button>
       </div>
 
-      {/* Health Bar */}
-      <div className="card" style={{ marginBottom: 20 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-          <span style={{ fontWeight: 700, fontSize: "0.9rem" }}>🏥 سلامت سشن‌ها</span>
-          <span style={{ fontWeight: 800, fontSize: "1.1rem", color: healthColor }}>{health}%</span>
+      {/* Health */}
+      <div style={C.card}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+          <span style={{ fontWeight:700, fontSize:14 }}>🏥 سلامت سشن‌ها</span>
+          <span style={{ fontWeight:800, fontSize:18, color:hColor }}>{health}%</span>
         </div>
-        <div className="health-bar-wrap">
-          <div className="health-bar-fill" style={{ width: `${health}%`, background: healthColor }} />
+        <div style={{ background:"#f1f5f9", borderRadius:8, height:12, overflow:"hidden" }}>
+          <div style={{ width:`${health}%`, height:"100%", background:hColor, borderRadius:8, transition:"width 0.8s ease" }} />
         </div>
-        <div style={{ display: "flex", gap: 16, marginTop: 10, flexWrap: "wrap" }}>
-          <span style={{ fontSize: "0.75rem", color: "#22c55e", fontWeight: 600 }}>✅ فعال: {s.active || 0}</span>
-          <span style={{ fontSize: "0.75rem", color: "#ef4444", fontWeight: 600 }}>❌ لاگ‌اوت: {s.logged_out || 0}</span>
-          <span style={{ fontSize: "0.75rem", color: "#f59e0b", fontWeight: 600 }}>🌊 فلود: {s.flood || 0}</span>
-          <span style={{ fontSize: "0.75rem", color: "#8b5cf6", fontWeight: 600 }}>🚫 بن: {s.banned || 0}</span>
-          <span style={{ fontSize: "0.75rem", color: "#ef4444", fontWeight: 600 }}>⚠️ خطا: {s.error || 0}</span>
+        <div style={{ display:"flex", gap:16, marginTop:10, flexWrap:"wrap" }}>
+          {[
+            ["✅ فعال", s.active, "#22c55e"],
+            ["🔴 لاگ‌اوت", s.logged_out, "#ef4444"],
+            ["🌊 فلود", s.flood, "#f59e0b"],
+            ["🚫 بن", s.banned, "#8b5cf6"],
+            ["⚠️ خطا", s.error, "#ef4444"],
+          ].map(([label, val, color]) => (
+            <span key={label} style={{ fontSize:12, color, fontWeight:600 }}>{label}: {num(val)}</span>
+          ))}
         </div>
       </div>
 
-      {/* Stats */}
-      <div className="stat-grid">
+      {/* Stats Grid */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))", gap:12, marginBottom:16 }}>
         <StatCard icon="📱" value={total.toLocaleString("fa-IR")} label="کل سشن‌ها" color="#6366f1" onClick={() => navigate("/sessions")} />
-        <StatCard icon="✅" value={active.toLocaleString("fa-IR")} label="سشن فعال" color="#22c55e" onClick={() => navigate("/sessions")} />
-        <StatCard icon="⚡" value={Number(t.running || 0)} label="تسک فعال" color="#f59e0b" onClick={() => navigate("/tasks")} />
-        <StatCard icon="🔍" value={Number(o.confirming || 0)} label="سفارش در بررسی" color="#06b6d4" onClick={() => navigate("/orders")} />
-        <StatCard icon="👥" value={Number(u.total || 0)} label="کاربران" color="#8b5cf6" onClick={() => navigate("/users")} />
-        <StatCard icon="💵" value={"$" + Number(o.total_revenue || 0).toFixed(0)} label="درآمد کل" color="#22c55e" onClick={() => navigate("/orders")} />
+        <StatCard icon="✅" value={num(s.active).toLocaleString("fa-IR")} label="سشن فعال" color="#22c55e" onClick={() => navigate("/sessions")} />
+        <StatCard icon="⚡" value={num(t.running)} label="تسک فعال" color="#f59e0b" onClick={() => navigate("/tasks")} />
+        <StatCard icon="🔍" value={num(o.confirming)} label="سفارش در بررسی" color="#06b6d4" onClick={() => navigate("/orders")} />
+        <StatCard icon="👥" value={num(u.total)} label="کاربران" color="#8b5cf6" onClick={() => navigate("/users")} />
+        <StatCard icon="💵" value={"$"+num(o.total_revenue).toFixed(0)} label="درآمد کل" color="#22c55e" onClick={() => navigate("/orders")} />
       </div>
 
-      {/* Charts */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px,1fr))", gap: 16, marginBottom: 20 }}>
-        <div className="card" style={{ marginBottom: 0 }}>
-          <div className="card-header"><span className="card-title">📱 وضعیت سشن‌ها</span></div>
-          {pieData.length > 0 ? (
-            <>
-              <ResponsiveContainer width="100%" height={180}>
-                <PieChart>
-                  <Pie data={pieData} cx="50%" cy="50%" innerRadius={50} outerRadius={75} dataKey="value" paddingAngle={3}>
-                    {pieData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-                  </Pie>
-                  <Tooltip formatter={v => v.toLocaleString("fa-IR")} />
-                </PieChart>
-              </ResponsiveContainer>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
-                {pieData.map((d, i) => (
-                  <span key={i} style={{ fontSize: "0.72rem", display: "flex", alignItems: "center", gap: 4 }}>
-                    <span style={{ width: 8, height: 8, borderRadius: "50%", background: COLORS[i % COLORS.length], display: "inline-block" }} />
-                    {d.name}: {d.value}
-                  </span>
-                ))}
+      {/* Task & Session status */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(260px,1fr))", gap:16, marginBottom:16 }}>
+        {/* Sessions */}
+        <div style={C.card}>
+          <div style={{ ...C.cardHeader, marginBottom:12 }}><span style={C.cardTitle}>📱 وضعیت سشن‌ها</span></div>
+          {[
+            ["✅ فعال", s.active, "#22c55e"],
+            ["🔴 لاگ‌اوت", s.logged_out, "#ef4444"],
+            ["🌊 فلود", s.flood, "#f59e0b"],
+            ["🚫 بن", s.banned, "#8b5cf6"],
+            ["⚠️ خطا", s.error, "#94a3b8"],
+          ].map(([label, val, color]) => {
+            const v = num(val);
+            const pct = total > 0 ? Math.round((v/total)*100) : 0;
+            return (
+              <div key={label} style={{ marginBottom:10 }}>
+                <div style={{ display:"flex", justifyContent:"space-between", fontSize:12, marginBottom:4 }}>
+                  <span style={{ fontWeight:600 }}>{label}</span>
+                  <span style={{ color:"#94a3b8" }}>{v} ({pct}%)</span>
+                </div>
+                <div style={{ background:"#f1f5f9", borderRadius:6, height:7, overflow:"hidden" }}>
+                  <div style={{ width:`${pct}%`, height:"100%", background:color, borderRadius:6, transition:"width 0.6s" }} />
+                </div>
               </div>
-            </>
-          ) : (
-            <div className="empty-state" style={{ padding: "24px" }}>
-              <div className="icon">📱</div><p>داده‌ای موجود نیست</p>
-            </div>
-          )}
+            );
+          })}
         </div>
 
-        <div className="card" style={{ marginBottom: 0 }}>
-          <div className="card-header"><span className="card-title">📋 وضعیت تسک‌ها</span></div>
-          <ResponsiveContainer width="100%" height={200}>
-            <BarChart data={barData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
-              <XAxis dataKey="name" tick={{ fontSize: 10, fontFamily: "Vazirmatn" }} />
-              <YAxis tick={{ fontSize: 10 }} />
-              <Tooltip formatter={v => v.toLocaleString("fa-IR")} />
-              <Bar dataKey="value" name="تعداد" radius={[6,6,0,0]}>
-                {barData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
+        {/* Tasks */}
+        <div style={C.card}>
+          <div style={{ ...C.cardHeader, marginBottom:12 }}><span style={C.cardTitle}>📋 وضعیت تسک‌ها</span></div>
+          {[
+            ["⏳ در صف", t.pending, "#94a3b8"],
+            ["⚡ در حال اجرا", t.running, "#06b6d4"],
+            ["✅ تکمیل", t.completed, "#22c55e"],
+            ["❌ ناموفق", t.failed, "#ef4444"],
+          ].map(([label, val, color]) => {
+            const v = num(val);
+            const tTotal = num(t.pending)+num(t.running)+num(t.completed)+num(t.failed);
+            const pct = tTotal > 0 ? Math.round((v/tTotal)*100) : 0;
+            return (
+              <div key={label} style={{ marginBottom:10 }}>
+                <div style={{ display:"flex", justifyContent:"space-between", fontSize:12, marginBottom:4 }}>
+                  <span style={{ fontWeight:600 }}>{label}</span>
+                  <span style={{ color:"#94a3b8" }}>{v}</span>
+                </div>
+                <div style={{ background:"#f1f5f9", borderRadius:6, height:7, overflow:"hidden" }}>
+                  <div style={{ width:`${pct}%`, height:"100%", background:color, borderRadius:6, transition:"width 0.6s" }} />
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
 
       {/* Quick Actions */}
-      <div className="card">
-        <div className="card-header"><span className="card-title">⚡ دسترسی سریع</span></div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px,1fr))", gap: 10 }}>
-          <QuickBtn icon="📱" label="سشن‌ها" sub={`${total} سشن ثبت‌شده`} color="#6366f1" onClick={() => navigate("/sessions")} />
-          <QuickBtn icon="📋" label="تسک‌ها" sub={`${t.pending || 0} در صف انتظار`} color="#f59e0b" onClick={() => navigate("/tasks")} />
-          <QuickBtn icon="💰" label="سفارشات" sub={`${o.confirming || 0} نیاز به بررسی`} color="#06b6d4" onClick={() => navigate("/orders")} />
-          <QuickBtn icon="👥" label="کاربران" sub={`${u.total || 0} نفر`} color="#8b5cf6" onClick={() => navigate("/users")} />
-          <QuickBtn icon="🌐" label="پروکسی‌ها" sub="مدیریت پروکسی‌ها" color="#22c55e" onClick={() => navigate("/proxies")} />
-          <QuickBtn icon="⚙️" label="تنظیمات" sub="پیکربندی سیستم" color="#64748b" onClick={() => navigate("/settings")} />
+      <div style={C.card}>
+        <div style={C.cardHeader}><span style={C.cardTitle}>⚡ دسترسی سریع</span></div>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))", gap:10 }}>
+          {[
+            ["📱","سشن‌ها",`${total} سشن`,"/sessions","#6366f1"],
+            ["📋","تسک‌ها",`${num(t.pending)} در صف`,"/tasks","#f59e0b"],
+            ["💰","سفارشات",`${num(o.confirming)} بررسی`,"/orders","#06b6d4"],
+            ["👥","کاربران",`${num(u.total)} نفر`,"/users","#8b5cf6"],
+            ["🌐","پروکسی‌ها","مدیریت","/proxies","#22c55e"],
+            ["⚙️","تنظیمات","پیکربندی","/settings","#64748b"],
+          ].map(([icon,label,sub,to,color]) => (
+            <button key={to} onClick={() => navigate(to)} style={{
+              display:"flex", alignItems:"center", gap:12, padding:"12px 14px",
+              borderRadius:10, border:`1.5px solid ${color}25`, background:"#fff",
+              cursor:"pointer", textAlign:"right", fontFamily:"inherit", transition:"all 0.15s",
+            }}
+            onMouseEnter={e => { e.currentTarget.style.borderColor=color; e.currentTarget.style.background=color+"08"; e.currentTarget.style.transform="translateY(-1px)"; }}
+            onMouseLeave={e => { e.currentTarget.style.borderColor=color+"25"; e.currentTarget.style.background="#fff"; e.currentTarget.style.transform=""; }}>
+              <div style={{ width:38, height:38, borderRadius:10, background:color+"18", display:"flex", alignItems:"center", justifyContent:"center", fontSize:18, flexShrink:0 }}>{icon}</div>
+              <div>
+                <div style={{ fontWeight:700, fontSize:13, color:"#0f172a" }}>{label}</div>
+                <div style={{ fontSize:11, color:"#94a3b8", marginTop:1 }}>{sub}</div>
+              </div>
+            </button>
+          ))}
         </div>
       </div>
     </div>
